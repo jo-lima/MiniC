@@ -1,139 +1,39 @@
 #!/usr/bin/env python3
-"""Analisador léxico e sintático recursivo-descendente para MiniC."""
+"""Parser recursivo-descendente para MiniC.
+
+O scanner fica em :mod:`scanner`; o parser recebe tokens e não conhece a
+implementação da tokenização.
+"""
 import sys
 from dataclasses import dataclass
+try:
+    from .scanner import Diagnostic, Scanner, Token, TYPES, tokenize
+except ImportError:
+    from scanner import Diagnostic, Scanner, Token, TYPES, tokenize
 
 
 class ParseError(Exception):
     def __init__(self, message, token):
-        super().__init__(
-            f"Erro sintático: {message} (linha {token.line}, coluna {token.column})"
-        )
-
-
-@dataclass
-class Token:
-    kind: str
-    text: str
-    line: int
-    column: int
-
-
-KEYWORDS = {
-    "int", "float", "bool", "void", "return", "if", "else", "while",
-    "true", "false",
-}
-TYPES = {"int", "float", "bool", "void"}
-
-
-def tokenize(source):
-    tokens = []
-    source_index = 0
-    line_number = 1
-    column_number = 1
-
-    def update_position(consumed_text):
-        nonlocal line_number, column_number
-        if "\n" in consumed_text:
-            line_number += consumed_text.count("\n")
-            column_number = len(consumed_text.rsplit("\n", 1)[-1]) + 1
-        else:
-            column_number += len(consumed_text)
-
-    # Comentários e operadores de dois caracteres precisam ser consumidos antes
-    # dos tokens de um caractere para que não sejam interpretados parcialmente.
-    while source_index < len(source):
-        current_character = source[source_index]
-        token_start = (line_number, column_number)
-
-        if current_character.isspace():
-            update_position(current_character)
-            source_index += 1
-            continue
-
-        if source.startswith("//", source_index):
-            end_index = source.find("\n", source_index)
-            end_index = len(source) if end_index < 0 else end_index
-            update_position(source[source_index:end_index])
-            source_index = end_index
-            continue
-
-        if source.startswith("/*", source_index):
-            end_index = source.find("*/", source_index + 2)
-            if end_index < 0:
-                raise ParseError(
-                    "comentário não terminado",
-                    Token("EOF", "", line_number, column_number),
-                )
-            end_index += 2
-            update_position(source[source_index:end_index])
-            source_index = end_index
-            continue
-
-        if current_character.isalpha() or current_character == "_":
-            end_index = source_index + 1
-            while end_index < len(source) and (
-                source[end_index].isalnum() or source[end_index] == "_"
-            ):
-                end_index += 1
-            token_text = source[source_index:end_index]
-            token_kind = token_text if token_text in KEYWORDS else "IDENT"
-            tokens.append(Token(token_kind, token_text, *token_start))
-        elif current_character.isdigit():
-            end_index = source_index
-            while end_index < len(source) and source[end_index].isdigit():
-                end_index += 1
-            token_kind = "INT"
-            if end_index < len(source) and source[end_index] == ".":
-                token_kind = "REAL"
-                end_index += 1
-                if end_index == len(source) or not source[end_index].isdigit():
-                    raise ParseError(
-                        "literal real inválido",
-                        Token("INVALID", ".", *token_start),
-                    )
-                while end_index < len(source) and source[end_index].isdigit():
-                    end_index += 1
-            tokens.append(Token(token_kind, source[source_index:end_index], *token_start))
-        else:
-            multi_character_operators = ("<=", ">=", "==", "!=", "&&", "||")
-            token_text = next(
-                (
-                    operator
-                    for operator in multi_character_operators
-                    if source.startswith(operator, source_index)
-                ),
-                current_character,
-            )
-            valid_single_character_tokens = set("+-*/=<>!;,:(){}[]")
-            if (
-                token_text not in valid_single_character_tokens
-                and token_text not in multi_character_operators
-            ):
-                raise ParseError(
-                    f"caractere inválido {current_character!r}",
-                    Token("INVALID", current_character, *token_start),
-                )
-            end_index = source_index + len(token_text)
-            tokens.append(Token(token_text, token_text, *token_start))
-
-        update_position(source[source_index:end_index])
-        source_index = end_index
-
-    tokens.append(Token("EOF", "", line_number, column_number))
-    return tokens
+        self.message = message
+        self.token = token
+        super().__init__(str(Diagnostic(message, token, "syntactic")))
 
 
 @dataclass
 class AstNode:
     tag: str
     values: tuple
+    line: int = 0
+    column: int = 0
 
 
 class Parser:
-    def __init__(self, source):
-        self.tokens = tokenize(source)
+    def __init__(self, tokens):
+        self.tokens = list(tokens)
+        if not self.tokens or self.tokens[-1].kind != "EOF":
+            raise ValueError("o parser requer uma sequência de tokens terminada em EOF")
         self.token_index = 0
+        self.errors = []
 
     @property
     def current_token(self):
@@ -165,24 +65,41 @@ class Parser:
 
     def parse(self):
         nodes = []
-        # Declarações começam por um tipo; os demais tokens iniciam comandos.
         while self.current_token.kind != "EOF":
-            if self.current_token.kind in TYPES:
-                nodes.append(self.parse_declaration())
-            else:
-                nodes.append(self.parse_statement())
+            try:
+                if self.current_token.kind in TYPES:
+                    nodes.append(self.parse_declaration())
+                else:
+                    nodes.append(self.parse_statement())
+            except ParseError as error:
+                self.errors.append(Diagnostic(error.message, error.token, "syntactic"))
+                self.synchronize()
+                if self.current_token.kind == "}":
+                    self.token_index += 1
         return AstNode("Program", tuple(nodes))
 
+    def synchronize(self):
+        """Avança até um ponto seguro sem consumir o fechamento de um bloco."""
+        while self.current_token.kind not in ("EOF", "}", ";"):
+            self.token_index += 1
+        if self.current_token.kind == ";":
+            self.token_index += 1
+
     def parse_declaration(self):
+        declaration_token = self.current_token
         variable_type = self.parse_type()
-        name = self.expect("IDENT", "IDENT").text
+        name_token = self.expect("IDENT", "IDENT")
+        name = name_token.text
         if self.consume("("):
             parameters = []
             if self.current_token.kind != ")":
                 while True:
                     parameter_type = self.parse_type(False)
-                    parameter_name = self.expect("IDENT", "IDENT").text
-                    parameters.append((parameter_type, parameter_name))
+                    parameter_token = self.expect("IDENT", "IDENT")
+                    is_array = bool(self.consume("["))
+                    if is_array:
+                        self.expect("]", "FECHA_COLCHETE")
+                    parameters.append((parameter_type, parameter_token.text, is_array))
                     if not self.consume(","):
                         break
                     if self.current_token.kind == ")":
@@ -191,12 +108,13 @@ class Parser:
             return AstNode(
                 "Function",
                 (variable_type, name, tuple(parameters), self.parse_block()),
+                declaration_token.line, declaration_token.column,
             )
         if variable_type == "void":
             raise ParseError("variável não pode ter tipo void", self.current_token)
-        return self.parse_variable_tail(variable_type, name)
+        return self.parse_variable_tail(variable_type, name, name_token)
 
-    def parse_variable_tail(self, variable_type, name):
+    def parse_variable_tail(self, variable_type, name, name_token=None):
         array_size = initializer = None
         if self.consume("["):
             array_size = self.parse_expression()
@@ -204,26 +122,38 @@ class Parser:
         if self.consume("="):
             initializer = self.parse_expression()
         self.expect(";", "PONTO_E_VIRGULA")
-        return AstNode("VarDecl", (variable_type, name, array_size, initializer))
+        return AstNode(
+            "VarDecl", (variable_type, name, array_size, initializer),
+            (name_token or self.current_token).line,
+            (name_token or self.current_token).column,
+        )
 
     def parse_block(self):
         self.expect("{", "ABRE_CHAVE")
         statements = []
         while self.current_token.kind != "}":
             if self.current_token.kind == "EOF":
-                self.expect("}", "FECHA_CHAVE")
-            statements.append(self.parse_statement())
+                raise ParseError("esperado FECHA_CHAVE", self.current_token)
+            try:
+                statements.append(self.parse_statement())
+            except ParseError as error:
+                if self.current_token.kind == "EOF":
+                    raise
+                self.errors.append(Diagnostic(error.message, error.token, "syntactic"))
+                self.synchronize()
         self.expect("}")
         return AstNode("Block", tuple(statements))
 
     def parse_statement(self):
         token_kind = self.current_token.kind
         if token_kind in TYPES:
+            type_token = self.current_token
             variable_type = self.parse_type()
             if variable_type == "void":
                 raise ParseError("declaração local void inválida", self.current_token)
-            name = self.expect("IDENT", "IDENT").text
-            return self.parse_variable_tail(variable_type, name)
+            name_token = self.expect("IDENT", "IDENT")
+            name = name_token.text
+            return self.parse_variable_tail(variable_type, name, name_token)
         if token_kind == "{":
             return self.parse_block()
         if token_kind == "if":
@@ -233,7 +163,7 @@ class Parser:
             self.expect(")", "FECHA_PAREN")
             consequent = self.parse_statement()
             alternative = self.parse_statement() if self.consume("else") else None
-            return AstNode("If", (condition, consequent, alternative))
+            return AstNode("If", (condition, consequent, alternative), condition.line, condition.column)
         if token_kind == "while":
             self.token_index += 1
             self.expect("(", "ABRE_PAREN")
@@ -241,8 +171,9 @@ class Parser:
             self.expect(")", "FECHA_PAREN")
             if self.current_token.kind in ("}", "EOF"):
                 raise ParseError("esperado início de statement", self.current_token)
-            return AstNode("While", (condition, self.parse_statement()))
+            return AstNode("While", (condition, self.parse_statement()), condition.line, condition.column)
         if token_kind == "return":
+            return_token = self.current_token
             self.token_index += 1
             returned_value = (
                 None
@@ -250,12 +181,12 @@ class Parser:
                 else self.parse_expression()
             )
             self.expect(";", "PONTO_E_VIRGULA")
-            return AstNode("Return", (returned_value,))
+            return AstNode("Return", (returned_value,), return_token.line, return_token.column)
         if token_kind == "else":
             raise ParseError("token KW_ELSE inesperado", self.current_token)
         expression = self.parse_expression()
         self.expect(";", "PONTO_E_VIRGULA")
-        return AstNode("ExprStmt", (expression,))
+        return AstNode("ExprStmt", (expression,), expression.line, expression.column)
 
     def parse_expression(self):
         return self.parse_assignment()
@@ -263,9 +194,7 @@ class Parser:
     def parse_assignment(self):
         left_expression = self.parse_binary_operation(self.parse_logical_or, ())
         if self.consume("="):
-            if left_expression.tag not in ("Id", "Index"):
-                raise ParseError("destino de atribuição inválido", self.current_token)
-            return AstNode("Assign", (left_expression, self.parse_assignment()))
+            return AstNode("Assign", (left_expression, self.parse_assignment()), left_expression.line, left_expression.column)
         return left_expression
 
     def parse_binary_operation(self, parse_operand, operators):
@@ -275,7 +204,8 @@ class Parser:
             self.token_index += 1
             right_expression = parse_operand()
             left_expression = AstNode(
-                "Binary", (operator, left_expression, right_expression)
+                "Binary", (operator, left_expression, right_expression),
+                left_expression.line, left_expression.column,
             )
         return left_expression
 
@@ -303,7 +233,8 @@ class Parser:
         if self.current_token.kind in ("!", "-", "+"):
             operator = self.current_token.text
             self.token_index += 1
-            return AstNode("Unary", (operator, self.parse_unary()))
+            operand = self.parse_unary()
+            return AstNode("Unary", (operator, operand), operand.line, operand.column)
         return self.parse_postfix()
 
     def parse_postfix(self):
@@ -318,25 +249,25 @@ class Parser:
                             raise ParseError("esperado expressão", self.current_token)
                         arguments.append(self.parse_expression())
                 self.expect(")", "FECHA_PAREN")
-                expression = AstNode("Call", (expression, tuple(arguments)))
+                expression = AstNode("Call", (expression, tuple(arguments)), expression.line, expression.column)
             elif self.consume("["):
                 index_expression = self.parse_expression()
                 self.expect("]", "FECHA_COLCHETE")
-                expression = AstNode("Index", (expression, index_expression))
+                expression = AstNode("Index", (expression, index_expression), expression.line, expression.column)
             else:
                 return expression
 
     def parse_primary(self):
         current_token = self.current_token
         if self.consume("IDENT"):
-            return AstNode("Id", (current_token.text,))
+            return AstNode("Id", (current_token.text,), current_token.line, current_token.column)
         if self.consume("INT"):
-            return AstNode("Lit", ("int", current_token.text))
+            return AstNode("Lit", ("int", current_token.text), current_token.line, current_token.column)
         if self.consume("REAL"):
-            return AstNode("Lit", ("real", current_token.text))
+            return AstNode("Lit", ("real", current_token.text), current_token.line, current_token.column)
         if current_token.kind in ("true", "false"):
             self.token_index += 1
-            return AstNode("Lit", ("bool", current_token.text))
+            return AstNode("Lit", ("bool", current_token.text), current_token.line, current_token.column)
         if self.consume("("):
             expression = self.parse_expression()
             self.expect(")", "FECHA_PAREN")
@@ -346,6 +277,293 @@ class Parser:
             current_token,
         )
 
+
+@dataclass
+class Symbol:
+    name: str
+    type: object
+    line: int
+    column: int
+
+
+class SemanticAnalyzer:
+    """Verifica tipos, nomes, escopos e caminhos de retorno da AST."""
+
+    def __init__(self, tree):
+        self.tree = tree
+        self.errors = []
+        self.scopes = []
+        self.functions = {}
+        self.current_function = None
+
+    def error(self, code, message, node):
+        self.errors.append((node.line, node.column, code, message))
+
+    def analyze(self):
+        # As assinaturas são coletadas antes dos corpos para permitir recursão.
+        for node in self.tree.values:
+            if node.tag == "Function":
+                return_type, name, parameters, _ = node.values
+                if name not in self.functions:
+                    self.functions[name] = (return_type, parameters, node)
+        self.push_scope()
+        for node in self.tree.values:
+            if node.tag == "Function":
+                self.check_function(node)
+            elif node.tag == "VarDecl":
+                self.check_declaration(node)
+            else:
+                self.check_statement(node)
+        self.pop_scope()
+        self.errors.sort(key=lambda item: (item[0], item[1]))
+        return self.errors
+
+    def push_scope(self):
+        self.scopes.append({})
+
+    def pop_scope(self):
+        self.scopes.pop()
+
+    def declare(self, name, type_name, node):
+        scope = self.scopes[-1]
+        if name in scope:
+            previous = scope[name]
+            self.error(
+                "SEM002",
+                f"“{name}” já declarado neste escopo; declaração anterior na "
+                f"linha {previous.line}, coluna {previous.column} (tipo {self.type_text(previous.type)}).",
+                node,
+            )
+            return
+        scope[name] = Symbol(name, type_name, node.line, node.column)
+
+    def resolve(self, name):
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def type_text(self, type_name):
+        if isinstance(type_name, tuple):
+            return f"{type_name[1]}[]"
+        return type_name
+
+    def is_numeric(self, type_name):
+        return type_name in ("int", "float")
+
+    def compatible(self, expected, actual):
+        return expected == actual or (expected == "float" and actual == "int")
+
+    def expression_text(self, node):
+        if node is None:
+            return ""
+        if node.tag == "Id":
+            return node.values[0]
+        if node.tag == "Lit":
+            return node.values[1]
+        if node.tag == "Unary":
+            return node.values[0] + self.expression_text(node.values[1])
+        if node.tag == "Binary":
+            operator, left, right = node.values
+            return f"{self.expression_text(left)} {operator} {self.expression_text(right)}"
+        if node.tag == "Assign":
+            return f"{self.expression_text(node.values[0])} = {self.expression_text(node.values[1])}"
+        if node.tag == "Index":
+            return f"{self.expression_text(node.values[0])}[{self.expression_text(node.values[1])}]"
+        if node.tag == "Call":
+            return f"{self.expression_text(node.values[0])}(" + ", ".join(
+                self.expression_text(argument) for argument in node.values[1]
+            ) + ")"
+        return ""
+
+    def check_function(self, node):
+        return_type, name, parameters, body = node.values
+        self.current_function = (return_type, name)
+        self.push_scope()
+        for parameter_type, parameter_name, is_array in parameters:
+            self.declare(parameter_name, (parameter_type, "array") if is_array else parameter_type, node)
+        self.check_block(body, create_scope=False)
+        if return_type != "void" and not self.definitely_returns(body):
+            self.error(
+                "SEM011",
+                f"A função “{name}” pode terminar sem retornar {return_type}; "
+                f"o ramo em que “condicao” é falso alcança o fim do corpo.",
+                node,
+            )
+        self.pop_scope()
+        self.current_function = None
+
+    def check_block(self, node, create_scope=True):
+        if create_scope:
+            self.push_scope()
+        for statement in node.values:
+            self.check_statement(statement)
+        if create_scope:
+            self.pop_scope()
+
+    def check_declaration(self, node):
+        variable_type, name, array_size, initializer = node.values
+        declared_type = (variable_type, "array") if array_size is not None else variable_type
+        self.declare(name, declared_type, node)
+        if array_size is not None:
+            size_type = self.check_expression(array_size)
+            if size_type != "int":
+                self.error("SEM006", f"Índice do vetor “{name}” deve ser int; recebeu {self.type_text(size_type)} "
+                           f"(expressão “{self.expression_text(array_size)}”).", array_size)
+        elif initializer is not None:
+            self.check_assignment_type(node, declared_type, initializer)
+
+    def check_statement(self, node):
+        if node.tag == "Block":
+            self.check_block(node)
+        elif node.tag == "VarDecl":
+            self.check_declaration(node)
+        elif node.tag == "ExprStmt":
+            expression = node.values[0]
+            if expression.tag == "Assign":
+                self.check_assignment(expression)
+            else:
+                self.check_expression(expression, value_required=False)
+        elif node.tag == "Assign":
+            self.check_assignment(node)
+        elif node.tag == "If":
+            condition, consequent, alternative = node.values
+            self.require_bool(condition)
+            self.check_statement(consequent)
+            if alternative:
+                self.check_statement(alternative)
+        elif node.tag == "While":
+            condition, body = node.values
+            self.require_bool(condition)
+            self.check_statement(body)
+        elif node.tag == "Return":
+            self.check_return(node)
+
+    def check_assignment(self, node):
+        left, right = node.values
+        left_type = self.check_lvalue(left)
+        self.check_assignment_type(left, left_type, right)
+
+    def check_assignment_type(self, target, expected, expression):
+        actual = self.check_expression(expression)
+        if expected is None or isinstance(expected, tuple):
+            return
+        if not self.compatible(expected, actual):
+            if actual in ("error", "void"):
+                return
+            self.error("SEM003", f"Não é possível atribuir {self.type_text(actual)} a {expected} "
+                       f"sem conversão permitida (destino “{self.expression_text(target)}”; "
+                       f"expressão “{self.expression_text(expression)}”).", expression)
+
+    def check_lvalue(self, node):
+        if node.tag == "Id":
+            symbol = self.resolve(node.values[0])
+            if symbol is None:
+                self.error("SEM001", f"Identificador “{node.values[0]}” não declarado neste escopo.", node)
+                return None
+            if isinstance(symbol.type, tuple):
+                return None
+            return symbol.type
+        if node.tag == "Index":
+            return self.check_index(node)
+        self.error("SEM013", f"Destino de atribuição não é atribuível; o literal inteiro "
+                   f"“{self.expression_text(node)}” não designa uma variável ou elemento de vetor.", node)
+        return None
+
+    def check_expression(self, node, value_required=True):
+        if node is None:
+            return "void"
+        if node.tag == "Id":
+            symbol = self.resolve(node.values[0])
+            if symbol is None:
+                self.error("SEM001", f"Identificador “{node.values[0]}” não declarado neste escopo.", node)
+                return "error"
+            return symbol.type
+        if node.tag == "Lit":
+            return "float" if node.values[0] == "real" else node.values[0]
+        if node.tag == "Assign":
+            self.check_assignment(node)
+            return self.check_lvalue(node.values[0])
+        if node.tag == "Index":
+            return self.check_index(node)
+        if node.tag == "Unary":
+            operator, operand = node.values
+            operand_type = self.check_expression(operand)
+            if operator == "!":
+                return "bool" if operand_type == "bool" else "error"
+            return operand_type if self.is_numeric(operand_type) else "error"
+        if node.tag == "Binary":
+            operator, left, right = node.values
+            left_type = self.check_expression(left)
+            right_type = self.check_expression(right)
+            if operator in ("&&", "||"):
+                return "bool" if left_type == right_type == "bool" else "error"
+            if operator in ("<", "<=", ">", ">="):
+                return "bool" if self.is_numeric(left_type) and self.is_numeric(right_type) else "error"
+            if operator in ("==", "!="):
+                return "bool" if self.compatible(left_type, right_type) or self.compatible(right_type, left_type) else "error"
+            if self.is_numeric(left_type) and self.is_numeric(right_type):
+                return "float" if "float" in (left_type, right_type) else "int"
+            return "error"
+        if node.tag == "Call":
+            function, arguments = node.values
+            name = function.values[0] if function.tag == "Id" else ""
+            signature = self.functions.get(name)
+            if signature is None:
+                self.check_expression(function)
+                return "error"
+            return_type, parameters, _ = signature
+            if len(arguments) != len(parameters):
+                self.error("SEM007", f"“{name}” espera {len(parameters)} argumentos, mas recebeu {len(arguments)}.", node)
+            for index, argument in enumerate(arguments):
+                actual = self.check_expression(argument)
+                if index < len(parameters):
+                    expected_type, _, is_array = parameters[index]
+                    expected = (expected_type, "array") if is_array else expected_type
+                    if expected != actual and not self.compatible(expected, actual):
+                        self.error("SEM008", f"Argumento {index + 1} de “{name}”: esperado {self.type_text(expected)}, "
+                                   f"recebido {self.type_text(actual)} (expressão “{self.expression_text(argument)}”).", argument)
+            if value_required and return_type == "void":
+                self.error("SEM012", f"Função “{name}” não produz valor (retorno void) e não pode ser usada como expressão de atribuição.", node)
+            return return_type
+        return "error"
+
+    def check_index(self, node):
+        collection, index = node.values
+        collection_type = self.check_expression(collection)
+        index_type = self.check_expression(index)
+        if index_type != "int":
+            name = collection.values[0] if collection.tag == "Id" else self.expression_text(collection)
+            self.error("SEM006", f"Índice do vetor “{name}” deve ser int; recebeu {self.type_text(index_type)} "
+                       f"(expressão “{self.expression_text(index)}”).", index)
+        return collection_type[0] if isinstance(collection_type, tuple) else "error"
+
+    def require_bool(self, node):
+        type_name = self.check_expression(node)
+        if type_name != "bool":
+            self.error("SEM005", f"Condição de while deve ter tipo bool; recebeu {self.type_text(type_name)} "
+                       f"(expressão “{self.expression_text(node)}”).", node)
+
+    def check_return(self, node):
+        returned = node.values[0]
+        return_type, name = self.current_function
+        actual = "void" if returned is None else self.check_expression(returned)
+        if not self.compatible(return_type, actual):
+            self.error("SEM009", f"Retorno {self.type_text(actual)} incompatível com o tipo {return_type} "
+                       f"da função “{name}”; conversão implícita de {self.type_text(actual)} para {return_type} não permitida.",
+                       returned or node)
+
+    def definitely_returns(self, node):
+        if node.tag == "Return":
+            return True
+        if node.tag == "Block":
+            return any(self.definitely_returns(statement) for statement in node.values)
+        if node.tag == "If":
+            return (self.definitely_returns(node.values[1]) and node.values[2] is not None
+                    and self.definitely_returns(node.values[2]))
+        return False
+
+
 def serialize_ast(node):
     if node is None:
         return "NULL"
@@ -354,8 +572,8 @@ def serialize_ast(node):
     if node.tag == "Function":
         return_type, function_name, parameters, function_body = node.values
         parameter_text = ",".join(
-            f"{parameter_type} {parameter_name}"
-            for parameter_type, parameter_name in parameters
+            f"{parameter_type} {parameter_name}" + ("[]" if is_array else "")
+            for parameter_type, parameter_name, is_array in parameters
         )
         return (
             f"Function({return_type} {function_name}({parameter_text}) "
@@ -475,22 +693,40 @@ def format_ast(tree, source=""):
     return serialized_text
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Uso: {sys.argv[0]} codigo.c", file=sys.stderr)
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--diagnostics"):
+        print(f"Uso: {sys.argv[0]} codigo.c [--diagnostics]", file=sys.stderr)
         return 2
     try:
         with open(sys.argv[1], encoding="utf8") as source_file:
             source_code = source_file.read()
-        syntax_tree = Parser(source_code).parse()
-        print(format_ast(syntax_tree, source_code))
+        scanner = Scanner(source_code)
+        tokens = scanner.scan()
+        parser = Parser(tokens)
+        syntax_tree = parser.parse()
+        diagnostics = scanner.errors + parser.errors
+        if diagnostics:
+            if len(sys.argv) == 3:
+                for diagnostic in diagnostics:
+                    print(diagnostic, file=sys.stderr)
+            print('NÃO HÁ AST: o parser deve rejeitar a entrada.')
+            return 1
+        semantic_errors = SemanticAnalyzer(syntax_tree).analyze()
+        if semantic_errors:
+            count = len(semantic_errors)
+            plural = "erro" if count == 1 else "erros"
+            output_lines = [
+                f"{code} — linha {line}, coluna {column}: {message}"
+                for line, column, code, message in semantic_errors
+            ]
+            output_lines.append(
+                f"Análise semântica concluída: {count} {plural}; programa rejeitado."
+            )
+            sys.stdout.write("\r\n".join(output_lines))
+            return 1
+        sys.stdout.write("Análise semântica concluída: 0 erros; programa aceito.")
     except OSError as operating_system_error:
         print(f"Erro: {operating_system_error}", file=sys.stderr)
         return 2
-    except ParseError:
-        # A interface definida pelo conjunto de testes reserva a saída padrão
-        # exclusivamente para a AST. Em uma rejeição, portanto, não há árvore.
-        print('NÃO HÁ AST: o parser deve rejeitar a entrada.')
-        return 1
     return 0
 
 

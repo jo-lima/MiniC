@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 typedef enum {
@@ -28,7 +29,16 @@ typedef struct {
   int token_count;
   int token_capacity;
   int current_index;
+  struct Diagnostic *diagnostics;
+  int diagnostic_count;
+  int diagnostic_capacity;
 } Tokens;
+typedef struct Diagnostic {
+  char *message;
+  char *phase;
+  int line;
+  int column;
+} Diagnostic;
 typedef enum {
   AST_PROGRAM, AST_FUNCTION, AST_BLOCK, AST_VARIABLE_DECLARATION, AST_IF,
   AST_WHILE, AST_RETURN, AST_EXPRESSION, AST_ASSIGNMENT, AST_BINARY,
@@ -44,6 +54,9 @@ struct AstNode {
   AstNode *third_child;
   AstNode **children;
   int child_count;
+  int line;
+  int column;
+  int is_array;
 };
 
 typedef struct {
@@ -52,7 +65,7 @@ typedef struct {
   size_t capacity;
 } Str;
 
-static int parsing_failed;
+static void append_text(Str *buffer, const char *text);
 
 static char *duplicate_text(const char *source, size_t length) {
   char *duplicated_text = malloc(length + 1);
@@ -62,7 +75,20 @@ static char *duplicate_text(const char *source, size_t length) {
   return duplicated_text;
 }
 
-static void mark_error(void) { parsing_failed = 1; }
+static void mark_error(Tokens *tokens, const char *phase, const char *message) {
+  if (tokens->diagnostic_count == tokens->diagnostic_capacity) {
+    tokens->diagnostic_capacity = tokens->diagnostic_capacity
+        ? tokens->diagnostic_capacity * 2 : 16;
+    tokens->diagnostics = realloc(
+        tokens->diagnostics,
+        tokens->diagnostic_capacity * sizeof *tokens->diagnostics);
+    if (!tokens->diagnostics) exit(2);
+  }
+  Token *token = &tokens->tokens[tokens->current_index];
+  tokens->diagnostics[tokens->diagnostic_count++] = (Diagnostic){
+      duplicate_text(message, strlen(message)),
+      duplicate_text(phase, strlen(phase)), token->line, token->column};
+}
 
 static void append_token(
     Tokens *token_list, TokenKind token_kind, const char *source,
@@ -131,7 +157,7 @@ static Tokens tokenize(const char *source) {
         }
       }
       if (!source[source_index]) {
-        mark_error();
+        mark_error(&token_list, "lexical", "literal real inválido");
         break;
       }
       source_index += 2;
@@ -164,7 +190,7 @@ static Tokens tokenize(const char *source) {
         source_index++;
         column_number++;
         if (!isdigit((unsigned char)source[source_index])) {
-          mark_error();
+          mark_error(&token_list, "lexical", "comentário não terminado");
           break;
         }
         do {
@@ -201,7 +227,11 @@ static Tokens tokenize(const char *source) {
       case '}': token_kind = TOKEN_RIGHT_BRACE; break;
       case '[': token_kind = TOKEN_LEFT_BRACKET; break;
       case ']': token_kind = TOKEN_RIGHT_BRACKET; break;
-      default: mark_error(); break;
+      default:
+        mark_error(&token_list, "lexical", "caractere inválido");
+        source_index++;
+        column_number++;
+        continue;
     }
     append_token(&token_list, token_kind, source + source_index,
                  token_length, line_number, token_column);
@@ -224,8 +254,22 @@ static int consume_token(Tokens *tokens, TokenKind expected_kind) {
 
 static int expect_token(Tokens *tokens, TokenKind expected_kind) {
   if (consume_token(tokens, expected_kind)) return 1;
-  mark_error();
+  mark_error(tokens, "syntactic", "token inesperado");
   return 0;
+}
+
+static void synchronize(Tokens *tokens, int consume_right_brace) {
+  while (current_token(tokens)->kind != TOKEN_EOF
+      && current_token(tokens)->kind != TOKEN_SEMICOLON
+      && current_token(tokens)->kind != TOKEN_RIGHT_BRACE) {
+    tokens->current_index++;
+  }
+  if (current_token(tokens)->kind == TOKEN_SEMICOLON) {
+    tokens->current_index++;
+  } else if (consume_right_brace
+      && current_token(tokens)->kind == TOKEN_RIGHT_BRACE) {
+    tokens->current_index++;
+  }
 }
 
 static int is_type(TokenKind token_kind) {
@@ -240,6 +284,13 @@ static AstNode *create_node(AstTag tag) {
   return new_node;
 }
 
+static void set_node_position(AstNode *node, const Token *token) {
+  if (token) {
+    node->line = token->line;
+    node->column = token->column;
+  }
+}
+
 static void append_child(AstNode *parent_node, AstNode *child_node) {
   parent_node->children = realloc(
       parent_node->children,
@@ -248,9 +299,33 @@ static void append_child(AstNode *parent_node, AstNode *child_node) {
   parent_node->children[parent_node->child_count++] = child_node;
 }
 
+static void free_ast(AstNode *node) {
+  if (!node) return;
+  free_ast(node->first_child);
+  free_ast(node->second_child);
+  free_ast(node->third_child);
+  for (int index = 0; index < node->child_count; index++) {
+    free_ast(node->children[index]);
+  }
+  free(node->children);
+  free(node);
+}
+
+static void free_tokens(Tokens *tokens) {
+  for (int index = 0; index < tokens->token_count; index++) {
+    free(tokens->tokens[index].text);
+  }
+  free(tokens->tokens);
+  for (int index = 0; index < tokens->diagnostic_count; index++) {
+    free(tokens->diagnostics[index].message);
+    free(tokens->diagnostics[index].phase);
+  }
+  free(tokens->diagnostics);
+}
+
 static char *read_identifier(Tokens *tokens) {
   if (current_token(tokens)->kind != TOKEN_IDENTIFIER) {
-    mark_error();
+    mark_error(tokens, "syntactic", "identificador esperado");
     return duplicate_text("", 0);
   }
   return tokens->tokens[tokens->current_index++].text;
@@ -259,7 +334,7 @@ static char *read_identifier(Tokens *tokens) {
 static char *read_type(Tokens *tokens, int allow_void) {
   if (!is_type(current_token(tokens)->kind)
       || (current_token(tokens)->kind == TOKEN_VOID && !allow_void)) {
-    mark_error();
+    mark_error(tokens, "syntactic", "tipo esperado");
     return duplicate_text("", 0);
   }
   return tokens->tokens[tokens->current_index++].text;
@@ -269,10 +344,12 @@ static AstNode *parse_expression(Tokens *tokens);
 static AstNode *parse_statement(Tokens *tokens);
 
 static AstNode *parse_variable_tail(
-    Tokens *tokens, char *variable_type, char *variable_name) {
+    Tokens *tokens, char *variable_type, char *variable_name,
+    const Token *name_token) {
   AstNode *variable_declaration = create_node(AST_VARIABLE_DECLARATION);
   variable_declaration->first_text = variable_type;
   variable_declaration->second_text = variable_name;
+  set_node_position(variable_declaration, name_token);
 
   if (consume_token(tokens, TOKEN_LEFT_BRACKET)) {
     variable_declaration->first_child = parse_expression(tokens);
@@ -291,38 +368,53 @@ static AstNode *parse_block(Tokens *tokens) {
 
   while (current_token(tokens)->kind != TOKEN_RIGHT_BRACE
       && current_token(tokens)->kind != TOKEN_EOF) {
+    int initial_token_index = tokens->current_index;
+    int initial_error_count = tokens->diagnostic_count;
     append_child(block, parse_statement(tokens));
+    if (tokens->current_index == initial_token_index
+        || tokens->diagnostic_count > initial_error_count) {
+      synchronize(tokens, 0);
+    }
   }
   expect_token(tokens, TOKEN_RIGHT_BRACE);
   return block;
 }
 
 static AstNode *parse_declaration(Tokens *tokens) {
+  Token *type_token = current_token(tokens);
   char *return_type = read_type(tokens, 1);
+  Token *name_token = current_token(tokens);
   char *declaration_name = read_identifier(tokens);
 
   if (!consume_token(tokens, TOKEN_LEFT_PARENTHESIS)) {
     if (!strcmp(return_type, "void")) {
-      mark_error();
+      mark_error(tokens, "syntactic", "variável void inválida");
       return create_node(AST_VARIABLE_DECLARATION);
     }
-    return parse_variable_tail(tokens, return_type, declaration_name);
+    return parse_variable_tail(tokens, return_type, declaration_name, name_token);
   }
 
   AstNode *function = create_node(AST_FUNCTION);
   function->first_text = return_type;
   function->second_text = declaration_name;
+  set_node_position(function, type_token);
   if (current_token(tokens)->kind != TOKEN_RIGHT_PARENTHESIS) {
     while (1) {
       AstNode *parameter = create_node(AST_VARIABLE_DECLARATION);
       parameter->first_text = read_type(tokens, 0);
+      Token *parameter_name_token = current_token(tokens);
       parameter->second_text = read_identifier(tokens);
+      if (consume_token(tokens, TOKEN_LEFT_BRACKET)) {
+        expect_token(tokens, TOKEN_RIGHT_BRACKET);
+        parameter->is_array = 1;
+      }
+      set_node_position(parameter, parameter_name_token);
       append_child(function, parameter);
       if (!consume_token(tokens, TOKEN_COMMA)) {
         break;
       }
       if (current_token(tokens)->kind == TOKEN_RIGHT_PARENTHESIS) {
-        mark_error();
+        mark_error(tokens, "syntactic", "tipo esperado após vírgula");
         break;
       }
     }
@@ -337,9 +429,10 @@ static AstNode *parse_statement(Tokens *tokens) {
   if (is_type(statement_kind)) {
     char *variable_type = read_type(tokens, 1);
     if (!strcmp(variable_type, "void")) {
-      mark_error();
+      mark_error(tokens, "syntactic", "declaração local void inválida");
     }
-    return parse_variable_tail(tokens, variable_type, read_identifier(tokens));
+    Token *name_token = current_token(tokens);
+    return parse_variable_tail(tokens, variable_type, read_identifier(tokens), name_token);
   }
   if (statement_kind == TOKEN_LEFT_BRACE) {
     return parse_block(tokens);
@@ -348,6 +441,8 @@ static AstNode *parse_statement(Tokens *tokens) {
     AstNode *conditional = create_node(AST_IF);
     expect_token(tokens, TOKEN_LEFT_PARENTHESIS);
     conditional->first_child = parse_expression(tokens);
+    conditional->line = conditional->first_child->line;
+    conditional->column = conditional->first_child->column;
     expect_token(tokens, TOKEN_RIGHT_PARENTHESIS);
     conditional->second_child = parse_statement(tokens);
     if (consume_token(tokens, TOKEN_ELSE)) {
@@ -359,24 +454,28 @@ static AstNode *parse_statement(Tokens *tokens) {
     AstNode *loop = create_node(AST_WHILE);
     expect_token(tokens, TOKEN_LEFT_PARENTHESIS);
     loop->first_child = parse_expression(tokens);
+    loop->line = loop->first_child->line;
+    loop->column = loop->first_child->column;
     expect_token(tokens, TOKEN_RIGHT_PARENTHESIS);
     if (current_token(tokens)->kind == TOKEN_RIGHT_BRACE
         || current_token(tokens)->kind == TOKEN_EOF) {
-      mark_error();
+      mark_error(tokens, "syntactic", "corpo do while esperado");
     }
     loop->second_child = parse_statement(tokens);
     return loop;
   }
   if (consume_token(tokens, TOKEN_RETURN)) {
+    Token *return_token = &tokens->tokens[tokens->current_index - 1];
     AstNode *return_statement = create_node(AST_RETURN);
     if (current_token(tokens)->kind != TOKEN_SEMICOLON) {
       return_statement->first_child = parse_expression(tokens);
     }
+    set_node_position(return_statement, return_token);
     expect_token(tokens, TOKEN_SEMICOLON);
     return return_statement;
   }
   if (statement_kind == TOKEN_ELSE) {
-    mark_error();
+    mark_error(tokens, "syntactic", "token else inesperado");
     tokens->current_index++;
     return create_node(AST_EXPRESSION);
   }
@@ -392,18 +491,21 @@ static AstNode *parse_primary_expression(Tokens *tokens) {
   if (consume_token(tokens, TOKEN_IDENTIFIER)) {
     AstNode *identifier = create_node(AST_IDENTIFIER);
     identifier->first_text = token->text;
+    set_node_position(identifier, token);
     return identifier;
   }
   if (consume_token(tokens, TOKEN_INTEGER_LITERAL)) {
     AstNode *literal = create_node(AST_LITERAL);
     literal->first_text = "int";
     literal->second_text = token->text;
+    set_node_position(literal, token);
     return literal;
   }
   if (consume_token(tokens, TOKEN_REAL_LITERAL)) {
     AstNode *literal = create_node(AST_LITERAL);
     literal->first_text = "real";
     literal->second_text = token->text;
+    set_node_position(literal, token);
     return literal;
   }
   if (token->kind == TOKEN_TRUE || token->kind == TOKEN_FALSE) {
@@ -411,6 +513,7 @@ static AstNode *parse_primary_expression(Tokens *tokens) {
     AstNode *literal = create_node(AST_LITERAL);
     literal->first_text = "bool";
     literal->second_text = token->text;
+    set_node_position(literal, token);
     return literal;
   }
   if (consume_token(tokens, TOKEN_LEFT_PARENTHESIS)) {
@@ -418,7 +521,7 @@ static AstNode *parse_primary_expression(Tokens *tokens) {
     expect_token(tokens, TOKEN_RIGHT_PARENTHESIS);
     return expression;
   }
-  mark_error();
+  mark_error(tokens, "syntactic", "expressão esperada");
   return create_node(AST_IDENTIFIER);
 }
 
@@ -428,11 +531,13 @@ static AstNode *parse_postfix_expression(Tokens *tokens) {
     if (consume_token(tokens, TOKEN_LEFT_PARENTHESIS)) {
       AstNode *call = create_node(AST_CALL);
       call->first_child = expression;
+      call->line = expression->line;
+      call->column = expression->column;
       if (current_token(tokens)->kind != TOKEN_RIGHT_PARENTHESIS) {
         append_child(call, parse_expression(tokens));
         while (consume_token(tokens, TOKEN_COMMA)) {
           if (current_token(tokens)->kind == TOKEN_RIGHT_PARENTHESIS) {
-            mark_error();
+            mark_error(tokens, "syntactic", "expressão esperada após vírgula");
           }
           append_child(call, parse_expression(tokens));
         }
@@ -442,6 +547,8 @@ static AstNode *parse_postfix_expression(Tokens *tokens) {
     } else if (consume_token(tokens, TOKEN_LEFT_BRACKET)) {
       AstNode *index = create_node(AST_INDEX);
       index->first_child = expression;
+      index->line = expression->line;
+      index->column = expression->column;
       index->second_child = parse_expression(tokens);
       expect_token(tokens, TOKEN_RIGHT_BRACKET);
       expression = index;
@@ -459,6 +566,8 @@ static AstNode *parse_unary_expression(Tokens *tokens) {
     unary->first_text = current_token(tokens)->text;
     tokens->current_index++;
     unary->first_child = parse_unary_expression(tokens);
+    unary->line = unary->first_child->line;
+    unary->column = unary->first_child->column;
     return unary;
   }
   return parse_postfix_expression(tokens);
@@ -482,6 +591,8 @@ static AstNode *parse_binary_expression(
     tokens->current_index++;
     binary->first_child = left_operand;
     binary->second_child = parse_operand(tokens);
+    binary->line = binary->first_child->line;
+    binary->column = binary->first_child->column;
     left_operand = binary;
   }
 }
@@ -523,12 +634,10 @@ static AstNode *parse_assignment(Tokens *tokens) {
   if (!consume_token(tokens, TOKEN_ASSIGN)) {
     return left_expression;
   }
-  if (left_expression->tag != AST_IDENTIFIER
-      && left_expression->tag != AST_INDEX) {
-    mark_error();
-  }
   AstNode *assignment = create_node(AST_ASSIGNMENT);
   assignment->first_child = left_expression;
+  assignment->line = left_expression->line;
+  assignment->column = left_expression->column;
   assignment->second_child = parse_assignment(tokens);
   return assignment;
 }
@@ -541,17 +650,365 @@ static AstNode *parse_program(Tokens *tokens) {
   AstNode *program = create_node(AST_PROGRAM);
   while (current_token(tokens)->kind != TOKEN_EOF) {
     int initial_token_index = tokens->current_index;
+    int initial_error_count = tokens->diagnostic_count;
     if (is_type(current_token(tokens)->kind)) {
       append_child(program, parse_declaration(tokens));
     } else {
       append_child(program, parse_statement(tokens));
     }
-    if (tokens->current_index == initial_token_index) {
-      mark_error();
-      tokens->current_index++;
+    if (tokens->current_index == initial_token_index
+        || tokens->diagnostic_count > initial_error_count) {
+      synchronize(tokens, 1);
     }
   }
   return program;
+}
+
+typedef enum {
+  SEM_TYPE_ERROR, SEM_TYPE_VOID, SEM_TYPE_INT, SEM_TYPE_FLOAT, SEM_TYPE_BOOL,
+  SEM_TYPE_INT_ARRAY, SEM_TYPE_FLOAT_ARRAY, SEM_TYPE_BOOL_ARRAY
+} SemanticType;
+
+typedef struct {
+  char *name;
+  SemanticType type;
+  int line;
+  int column;
+} SemanticSymbol;
+
+typedef struct {
+  SemanticSymbol *symbols;
+  int count;
+} SemanticScope;
+
+typedef struct {
+  char *code;
+  char *message;
+  int line;
+  int column;
+} SemanticDiagnostic;
+
+typedef struct {
+  AstNode *program;
+  SemanticScope *scopes;
+  int scope_count;
+  SemanticDiagnostic *diagnostics;
+  int diagnostic_count;
+  int diagnostic_capacity;
+  AstNode *current_function;
+} SemanticAnalyzer;
+
+static int is_numeric_type(SemanticType type) {
+  return type == SEM_TYPE_INT || type == SEM_TYPE_FLOAT;
+}
+
+static int is_array_type(SemanticType type) {
+  return type == SEM_TYPE_INT_ARRAY || type == SEM_TYPE_FLOAT_ARRAY
+      || type == SEM_TYPE_BOOL_ARRAY;
+}
+
+static SemanticType array_element_type(SemanticType type) {
+  if (type == SEM_TYPE_INT_ARRAY) return SEM_TYPE_INT;
+  if (type == SEM_TYPE_FLOAT_ARRAY) return SEM_TYPE_FLOAT;
+  if (type == SEM_TYPE_BOOL_ARRAY) return SEM_TYPE_BOOL;
+  return SEM_TYPE_ERROR;
+}
+
+static SemanticType base_type(const char *type_name, int is_array) {
+  if (!strcmp(type_name, "int")) return is_array ? SEM_TYPE_INT_ARRAY : SEM_TYPE_INT;
+  if (!strcmp(type_name, "float")) return is_array ? SEM_TYPE_FLOAT_ARRAY : SEM_TYPE_FLOAT;
+  if (!strcmp(type_name, "bool")) return is_array ? SEM_TYPE_BOOL_ARRAY : SEM_TYPE_BOOL;
+  return SEM_TYPE_VOID;
+}
+
+static const char *semantic_type_name(SemanticType type) {
+  switch (type) {
+    case SEM_TYPE_VOID: return "void";
+    case SEM_TYPE_INT: return "int";
+    case SEM_TYPE_FLOAT: return "float";
+    case SEM_TYPE_BOOL: return "bool";
+    case SEM_TYPE_INT_ARRAY: return "int[]";
+    case SEM_TYPE_FLOAT_ARRAY: return "float[]";
+    case SEM_TYPE_BOOL_ARRAY: return "bool[]";
+    default: return "error";
+  }
+}
+
+static int types_compatible(SemanticType expected, SemanticType actual) {
+  return expected == actual
+      || (expected == SEM_TYPE_FLOAT && actual == SEM_TYPE_INT);
+}
+
+static void semantic_error(
+    SemanticAnalyzer *analyzer, const char *code, int line, int column,
+    const char *format, ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  va_list copy;
+  va_copy(copy, arguments);
+  int length = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *message = malloc((size_t)length + 1);
+  if (!message) exit(2);
+  vsnprintf(message, (size_t)length + 1, format, arguments);
+  va_end(arguments);
+  if (analyzer->diagnostic_count == analyzer->diagnostic_capacity) {
+    analyzer->diagnostic_capacity = analyzer->diagnostic_capacity
+        ? analyzer->diagnostic_capacity * 2 : 16;
+    analyzer->diagnostics = realloc(
+        analyzer->diagnostics,
+        (size_t)analyzer->diagnostic_capacity * sizeof *analyzer->diagnostics);
+    if (!analyzer->diagnostics) exit(2);
+  }
+  SemanticDiagnostic *diagnostic =
+      &analyzer->diagnostics[analyzer->diagnostic_count++];
+  diagnostic->code = duplicate_text(code, strlen(code));
+  diagnostic->message = message;
+  diagnostic->line = line;
+  diagnostic->column = column;
+}
+
+static void semantic_push_scope(SemanticAnalyzer *analyzer) {
+  analyzer->scopes = realloc(
+      analyzer->scopes,
+      (size_t)(analyzer->scope_count + 1) * sizeof *analyzer->scopes);
+  if (!analyzer->scopes) exit(2);
+  analyzer->scopes[analyzer->scope_count++] = (SemanticScope){0};
+}
+
+static void semantic_pop_scope(SemanticAnalyzer *analyzer) {
+  SemanticScope *scope = &analyzer->scopes[analyzer->scope_count - 1];
+  for (int index = 0; index < scope->count; index++) {
+    free(scope->symbols[index].name);
+  }
+  free(scope->symbols);
+  analyzer->scope_count--;
+}
+
+static SemanticSymbol *semantic_resolve(
+    SemanticAnalyzer *analyzer, const char *name) {
+  for (int scope_index = analyzer->scope_count - 1; scope_index >= 0;
+       scope_index--) {
+    SemanticScope *scope = &analyzer->scopes[scope_index];
+    for (int index = 0; index < scope->count; index++) {
+      if (!strcmp(scope->symbols[index].name, name)) return &scope->symbols[index];
+    }
+  }
+  return NULL;
+}
+
+static void semantic_declare(
+    SemanticAnalyzer *analyzer, const char *name, SemanticType type,
+    const AstNode *node) {
+  SemanticScope *scope = &analyzer->scopes[analyzer->scope_count - 1];
+  for (int index = 0; index < scope->count; index++) {
+    if (!strcmp(scope->symbols[index].name, name)) {
+      SemanticSymbol *previous = &scope->symbols[index];
+      semantic_error(analyzer, "SEM002", node->line, node->column,
+          "“%s” já declarado neste escopo; declaração anterior na linha %d, "
+          "coluna %d (tipo %s).", name, previous->line, previous->column,
+          semantic_type_name(previous->type));
+      return;
+    }
+  }
+  scope->symbols = realloc(
+      scope->symbols, (size_t)(scope->count + 1) * sizeof *scope->symbols);
+  if (!scope->symbols) exit(2);
+  scope->symbols[scope->count++] = (SemanticSymbol){
+      duplicate_text(name, strlen(name)), type, node->line, node->column};
+}
+
+static void append_expression_text(Str *output, const AstNode *node) {
+  if (!node) return;
+  if (node->tag == AST_IDENTIFIER || node->tag == AST_LITERAL) {
+    append_text(output, node->tag == AST_IDENTIFIER
+        ? node->first_text : node->second_text);
+  } else if (node->tag == AST_UNARY) {
+    append_text(output, node->first_text);
+    append_expression_text(output, node->first_child);
+  } else if (node->tag == AST_BINARY) {
+    append_expression_text(output, node->first_child);
+    append_text(output, " ");
+    append_text(output, node->first_text);
+    append_text(output, " ");
+    append_expression_text(output, node->second_child);
+  } else if (node->tag == AST_ASSIGNMENT) {
+    append_expression_text(output, node->first_child);
+    append_text(output, " = ");
+    append_expression_text(output, node->second_child);
+  } else if (node->tag == AST_INDEX) {
+    append_expression_text(output, node->first_child);
+    append_text(output, "[");
+    append_expression_text(output, node->second_child);
+    append_text(output, "]");
+  } else if (node->tag == AST_CALL) {
+    append_expression_text(output, node->first_child);
+    append_text(output, "(");
+    for (int index = 0; index < node->child_count; index++) {
+      if (index) append_text(output, ", ");
+      append_expression_text(output, node->children[index]);
+    }
+    append_text(output, ")");
+  }
+}
+
+static char *semantic_expression_text(const AstNode *node) {
+  Str output = {0};
+  append_expression_text(&output, node);
+  return output.text ? output.text : duplicate_text("", 0);
+}
+
+static SemanticType semantic_expression(
+    SemanticAnalyzer *analyzer, AstNode *node, int value_required);
+static SemanticType semantic_lvalue(SemanticAnalyzer *analyzer, AstNode *node);
+
+static SemanticType semantic_index(
+    SemanticAnalyzer *analyzer, AstNode *node) {
+  SemanticType collection = semantic_expression(analyzer, node->first_child, 1);
+  SemanticType index = semantic_expression(analyzer, node->second_child, 1);
+  if (index != SEM_TYPE_INT) {
+    char *text = semantic_expression_text(node->second_child);
+    char *name = semantic_expression_text(node->first_child);
+    semantic_error(analyzer, "SEM006", node->second_child->line,
+        node->second_child->column,
+        "Índice do vetor “%s” deve ser int; recebeu %s (expressão “%s”).",
+        name, semantic_type_name(index), text);
+    free(text);
+    free(name);
+  }
+  return is_array_type(collection) ? array_element_type(collection) : SEM_TYPE_ERROR;
+}
+
+static void semantic_assignment_type(
+    SemanticAnalyzer *analyzer, AstNode *target, SemanticType expected,
+    AstNode *expression) {
+  SemanticType actual = semantic_expression(analyzer, expression, 1);
+  if (expected == SEM_TYPE_ERROR || is_array_type(expected)
+      || actual == SEM_TYPE_ERROR || actual == SEM_TYPE_VOID) return;
+  if (!types_compatible(expected, actual)) {
+    char *target_text = semantic_expression_text(target);
+    char *expression_text = semantic_expression_text(expression);
+    semantic_error(analyzer, "SEM003", expression->line, expression->column,
+        "Não é possível atribuir %s a %s sem conversão permitida (destino “%s”; "
+        "expressão “%s”).", semantic_type_name(actual),
+        semantic_type_name(expected), target_text, expression_text);
+    free(target_text);
+    free(expression_text);
+  }
+}
+
+static SemanticType semantic_lvalue(
+    SemanticAnalyzer *analyzer, AstNode *node) {
+  if (node->tag == AST_IDENTIFIER) {
+    SemanticSymbol *symbol = semantic_resolve(analyzer, node->first_text);
+    if (!symbol) {
+      semantic_error(analyzer, "SEM001", node->line, node->column,
+          "Identificador “%s” não declarado neste escopo.", node->first_text);
+      return SEM_TYPE_ERROR;
+    }
+
+    return is_array_type(symbol->type) ? SEM_TYPE_ERROR : symbol->type;
+  }
+  if (node->tag == AST_INDEX) return semantic_index(analyzer, node);
+  char *text = semantic_expression_text(node);
+  semantic_error(analyzer, "SEM013", node->line, node->column,
+      "Destino de atribuição não é atribuível; o literal inteiro “%s” não "
+      "designa uma variável ou elemento de vetor.", text);
+  free(text);
+  return SEM_TYPE_ERROR;
+}
+
+static SemanticType semantic_expression(
+    SemanticAnalyzer *analyzer, AstNode *node, int value_required) {
+  if (!node) return SEM_TYPE_VOID;
+  if (node->tag == AST_IDENTIFIER) {
+    SemanticSymbol *symbol = semantic_resolve(analyzer, node->first_text);
+    if (!symbol) {
+      semantic_error(analyzer, "SEM001", node->line, node->column,
+          "Identificador “%s” não declarado neste escopo.", node->first_text);
+      return SEM_TYPE_ERROR;
+    }
+    return symbol->type;
+  }
+  if (node->tag == AST_LITERAL) {
+    return !strcmp(node->first_text, "real") ? SEM_TYPE_FLOAT
+        : base_type(node->first_text, 0);
+  }
+  if (node->tag == AST_INDEX) return semantic_index(analyzer, node);
+  if (node->tag == AST_ASSIGNMENT) {
+    SemanticType left = semantic_lvalue(analyzer, node->first_child);
+    semantic_assignment_type(analyzer, node->first_child, left, node->second_child);
+    return left;
+  }
+  if (node->tag == AST_UNARY) {
+    SemanticType operand = semantic_expression(analyzer, node->first_child, 1);
+    if (!strcmp(node->first_text, "!")) return operand == SEM_TYPE_BOOL
+        ? SEM_TYPE_BOOL : SEM_TYPE_ERROR;
+    return is_numeric_type(operand) ? operand : SEM_TYPE_ERROR;
+  }
+  if (node->tag == AST_BINARY) {
+    SemanticType left = semantic_expression(analyzer, node->first_child, 1);
+    SemanticType right = semantic_expression(analyzer, node->second_child, 1);
+    if (!strcmp(node->first_text, "&&") || !strcmp(node->first_text, "||"))
+      return left == SEM_TYPE_BOOL && right == SEM_TYPE_BOOL
+          ? SEM_TYPE_BOOL : SEM_TYPE_ERROR;
+    if (!strcmp(node->first_text, "<") || !strcmp(node->first_text, "<=")
+        || !strcmp(node->first_text, ">") || !strcmp(node->first_text, ">="))
+      return is_numeric_type(left) && is_numeric_type(right)
+          ? SEM_TYPE_BOOL : SEM_TYPE_ERROR;
+    if (!strcmp(node->first_text, "==") || !strcmp(node->first_text, "!="))
+      return types_compatible(left, right) || types_compatible(right, left)
+          ? SEM_TYPE_BOOL : SEM_TYPE_ERROR;
+    return is_numeric_type(left) && is_numeric_type(right)
+        ? (left == SEM_TYPE_FLOAT || right == SEM_TYPE_FLOAT
+            ? SEM_TYPE_FLOAT : SEM_TYPE_INT) : SEM_TYPE_ERROR;
+  }
+  if (node->tag == AST_CALL) {
+    const char *name = node->first_child->tag == AST_IDENTIFIER
+        ? node->first_child->first_text : "";
+    AstNode *function = NULL;
+    for (int index = 0; index < analyzer->program->child_count; index++) {
+      AstNode *candidate = analyzer->program->children[index];
+      if (candidate->tag == AST_FUNCTION
+          && !strcmp(candidate->second_text, name)) {
+        function = candidate;
+        break;
+      }
+    }
+    if (!function) {
+      semantic_expression(analyzer, node->first_child, 1);
+      return SEM_TYPE_ERROR;
+    }
+    if (node->child_count != function->child_count) {
+      semantic_error(analyzer, "SEM007", node->line, node->column,
+          "“%s” espera %d argumentos, mas recebeu %d.", name,
+          function->child_count, node->child_count);
+    }
+    for (int index = 0; index < node->child_count; index++) {
+      SemanticType actual = semantic_expression(analyzer, node->children[index], 1);
+      if (index < function->child_count) {
+        AstNode *parameter = function->children[index];
+        SemanticType expected = base_type(parameter->first_text, parameter->is_array);
+        if (!types_compatible(expected, actual)) {
+          char *argument_text = semantic_expression_text(node->children[index]);
+          semantic_error(analyzer, "SEM008", node->children[index]->line,
+              node->children[index]->column,
+              "Argumento %d de “%s”: esperado %s, recebido %s (expressão “%s”).",
+              index + 1, name, semantic_type_name(expected),
+              semantic_type_name(actual), argument_text);
+          free(argument_text);
+        }
+      }
+    }
+    SemanticType result = base_type(function->first_text, 0);
+    if (value_required && result == SEM_TYPE_VOID) {
+      semantic_error(analyzer, "SEM012", node->line, node->column,
+          "Função “%s” não produz valor (retorno void) e não pode ser usada "
+          "como expressão de atribuição.", name);
+    }
+    return result;
+  }
+  return SEM_TYPE_ERROR;
 }
 
 static void append_text(Str *buffer, const char *text) {
@@ -564,6 +1021,159 @@ static void append_text(Str *buffer, const char *text) {
   memcpy(buffer->text + buffer->length, text, text_length);
   buffer->length += text_length;
   buffer->text[buffer->length] = 0;
+}
+
+static void semantic_statement(SemanticAnalyzer *analyzer, AstNode *node);
+
+static void semantic_declaration(
+    SemanticAnalyzer *analyzer, AstNode *node) {
+  SemanticType type = base_type(node->first_text, node->first_child != NULL);
+  semantic_declare(analyzer, node->second_text, type, node);
+  if (node->first_child) {
+    SemanticType size = semantic_expression(analyzer, node->first_child, 1);
+    if (size != SEM_TYPE_INT) {
+      char *text = semantic_expression_text(node->first_child);
+      semantic_error(analyzer, "SEM006", node->first_child->line,
+          node->first_child->column,
+          "Índice do vetor “%s” deve ser int; recebeu %s (expressão “%s”).",
+          node->second_text, semantic_type_name(size), text);
+      free(text);
+    }
+  } else if (node->second_child) {
+    semantic_assignment_type(analyzer, node, type, node->second_child);
+  }
+}
+
+static void semantic_block(
+    SemanticAnalyzer *analyzer, AstNode *block, int create_scope) {
+  if (create_scope) semantic_push_scope(analyzer);
+  for (int index = 0; index < block->child_count; index++) {
+    semantic_statement(analyzer, block->children[index]);
+  }
+  if (create_scope) semantic_pop_scope(analyzer);
+}
+
+static void semantic_statement(SemanticAnalyzer *analyzer, AstNode *node) {
+  switch (node->tag) {
+    case AST_BLOCK:
+      semantic_block(analyzer, node, 1);
+      break;
+    case AST_VARIABLE_DECLARATION:
+      semantic_declaration(analyzer, node);
+      break;
+    case AST_EXPRESSION:
+      if (node->first_child->tag == AST_ASSIGNMENT) {
+        SemanticType left = semantic_lvalue(analyzer, node->first_child->first_child);
+        semantic_assignment_type(analyzer, node->first_child->first_child,
+            left, node->first_child->second_child);
+      } else {
+        semantic_expression(analyzer, node->first_child, 0);
+      }
+      break;
+    case AST_ASSIGNMENT: {
+      SemanticType left = semantic_lvalue(analyzer, node->first_child);
+      semantic_assignment_type(analyzer, node->first_child, left, node->second_child);
+      break;
+    }
+    case AST_IF:
+    case AST_WHILE: {
+      SemanticType condition = semantic_expression(analyzer, node->first_child, 1);
+      if (condition != SEM_TYPE_BOOL) {
+        char *text = semantic_expression_text(node->first_child);
+        semantic_error(analyzer, "SEM005", node->first_child->line,
+            node->first_child->column,
+            "Condição de while deve ter tipo bool; recebeu %s (expressão “%s”).",
+            semantic_type_name(condition), text);
+        free(text);
+      }
+      semantic_statement(analyzer, node->second_child);
+      if (node->tag == AST_IF && node->third_child) {
+        semantic_statement(analyzer, node->third_child);
+      }
+      break;
+    }
+    case AST_RETURN: {
+      SemanticType expected = base_type(
+          analyzer->current_function->first_text, 0);
+      SemanticType actual = node->first_child
+          ? semantic_expression(analyzer, node->first_child, 1) : SEM_TYPE_VOID;
+      if (!types_compatible(expected, actual)) {
+        semantic_error(analyzer, "SEM009",
+            node->first_child ? node->first_child->line : node->line,
+            node->first_child ? node->first_child->column : node->column,
+            "Retorno %s incompatível com o tipo %s da função “%s”; conversão "
+            "implícita de %s para %s não permitida.",
+            semantic_type_name(actual), semantic_type_name(expected),
+            analyzer->current_function->second_text,
+            semantic_type_name(actual), semantic_type_name(expected));
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+static int definitely_returns(AstNode *node) {
+  if (!node) return 0;
+  if (node->tag == AST_RETURN) return 1;
+  if (node->tag == AST_BLOCK) {
+    for (int index = 0; index < node->child_count; index++) {
+      if (definitely_returns(node->children[index])) return 1;
+    }
+  }
+  if (node->tag == AST_IF) {
+    return definitely_returns(node->second_child)
+        && node->third_child && definitely_returns(node->third_child);
+  }
+  return 0;
+}
+
+static void semantic_function(
+    SemanticAnalyzer *analyzer, AstNode *function) {
+  analyzer->current_function = function;
+  semantic_push_scope(analyzer);
+  for (int index = 0; index < function->child_count; index++) {
+    AstNode *parameter = function->children[index];
+    semantic_declare(analyzer, parameter->second_text,
+        base_type(parameter->first_text, parameter->is_array), parameter);
+  }
+  semantic_block(analyzer, function->first_child, 0);
+  if (strcmp(function->first_text, "void")
+      && !definitely_returns(function->first_child)) {
+    semantic_error(analyzer, "SEM011", function->line, function->column,
+        "A função “%s” pode terminar sem retornar %s; o ramo em que "
+        "“condicao” é falso alcança o fim do corpo.",
+        function->second_text, function->first_text);
+  }
+  semantic_pop_scope(analyzer);
+  analyzer->current_function = NULL;
+}
+
+static int semantic_diagnostic_compare(
+    const void *left_pointer, const void *right_pointer) {
+  const SemanticDiagnostic *left = left_pointer;
+  const SemanticDiagnostic *right = right_pointer;
+  if (left->line != right->line) return left->line - right->line;
+  return left->column - right->column;
+}
+
+static void analyze_semantics(
+    AstNode *program, SemanticDiagnostic **diagnostics, int *diagnostic_count) {
+  SemanticAnalyzer analyzer = {.program = program};
+  semantic_push_scope(&analyzer);
+  for (int index = 0; index < program->child_count; index++) {
+    AstNode *node = program->children[index];
+    if (node->tag == AST_FUNCTION) semantic_function(&analyzer, node);
+    else if (node->tag == AST_VARIABLE_DECLARATION) semantic_declaration(&analyzer, node);
+    else semantic_statement(&analyzer, node);
+  }
+  semantic_pop_scope(&analyzer);
+  qsort(analyzer.diagnostics, (size_t)analyzer.diagnostic_count,
+      sizeof *analyzer.diagnostics, semantic_diagnostic_compare);
+  *diagnostics = analyzer.diagnostics;
+  *diagnostic_count = analyzer.diagnostic_count;
+  free(analyzer.scopes);
 }
 
 static void serialize_ast(Str *buffer, const AstNode *node) {
@@ -769,19 +1379,58 @@ static void format_output(AstNode *program, const char *source, Str *output) {
 }
 
 int main(int argument_count, char **arguments) {
-  if (argument_count != 2) return 2;
+  if (argument_count != 2
+      && !(argument_count == 3 && !strcmp(arguments[2], "--diagnostics"))) {
+    fprintf(stderr, "Uso: %s codigo.c [--diagnostics]\n", arguments[0]);
+    return 2;
+  }
   char *source = read_source_file(arguments[1]);
   if (!source) return 2;
 
   Tokens tokens = tokenize(source);
   AstNode *program = parse_program(&tokens);
-  if (parsing_failed) {
+  if (tokens.diagnostic_count) {
+    if (argument_count == 3) {
+      for (int index = 0; index < tokens.diagnostic_count; index++) {
+        Diagnostic *diagnostic = &tokens.diagnostics[index];
+        fprintf(stderr, "Erro %s: %s (linha %d, coluna %d)\n",
+                diagnostic->phase, diagnostic->message,
+                diagnostic->line, diagnostic->column);
+      }
+    }
     puts("NÃO HÁ AST: o parser deve rejeitar a entrada.");
+    free_ast(program);
+    free_tokens(&tokens);
+    free(source);
     return 1;
   }
 
-  Str output = {0};
-  format_output(program, source, &output);
-  puts(output.text);
+  SemanticDiagnostic *semantic_diagnostics = NULL;
+  int semantic_diagnostic_count = 0;
+  analyze_semantics(program, &semantic_diagnostics, &semantic_diagnostic_count);
+  if (semantic_diagnostic_count) {
+    for (int index = 0; index < semantic_diagnostic_count; index++) {
+      SemanticDiagnostic *diagnostic = &semantic_diagnostics[index];
+      printf("%s — linha %d, coluna %d: %s",
+          diagnostic->code, diagnostic->line, diagnostic->column,
+          diagnostic->message);
+      if (index + 1 < semantic_diagnostic_count) printf("\r\n");
+      free(diagnostic->code);
+      free(diagnostic->message);
+    }
+    printf("\r\nAnálise semântica concluída: %d %s; programa rejeitado.",
+        semantic_diagnostic_count,
+        semantic_diagnostic_count == 1 ? "erro" : "erros");
+    free(semantic_diagnostics);
+    free_ast(program);
+    free_tokens(&tokens);
+    free(source);
+    return 1;
+  }
+  free(semantic_diagnostics);
+  printf("Análise semântica concluída: 0 erros; programa aceito.");
+  free_ast(program);
+  free_tokens(&tokens);
+  free(source);
   return 0;
 }

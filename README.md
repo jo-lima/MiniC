@@ -76,3 +76,29 @@ O analisador gera:
 {"type":"operator","value":"=","row":0,"colSpan":[14,15]}
 {"type":"int","value":"42","row":0,"colSpan":[16,18]}
 ```
+
+## Integração scanner/parser
+
+O scanner independente está em `MiniCompiler/scanner.py`. Ele pode ser usado
+diretamente:
+
+```python
+from scanner import Scanner
+from MiniCompiler import Parser
+
+scanner = Scanner("int x; @")
+tokens = scanner.scan()
+parser = Parser(tokens)
+tree = parser.parse()
+erros = scanner.errors + parser.errors
+```
+
+O scanner e o parser acumulam diagnósticos e continuam a análise após pontos
+de recuperação. Para exibir todos os diagnósticos pela linha de comando:
+
+```bash
+python MiniCompiler/MiniCompiler.py codigo.c --diagnostics
+```
+
+Sem essa opção, a saída mantém o formato compatível com os testes do parser:
+uma AST para entradas válidas ou `NÃO HÁ AST` para entradas rejeitadas.
