@@ -1659,11 +1659,11 @@ int main(int argument_count, char **arguments) {
       printf("%s — linha %d, coluna %d: %s",
           diagnostic->code, diagnostic->line, diagnostic->column,
           diagnostic->message);
-      if (index + 1 < semantic_diagnostic_count) printf("\r\n");
+      if (index + 1 < semantic_diagnostic_count) printf("\n");
       free(diagnostic->code);
       free(diagnostic->message);
     }
-    printf("\r\nAnálise semântica concluída: %d %s; programa rejeitado.",
+    printf("\nAnálise semântica concluída: %d %s; programa rejeitado.",
         semantic_diagnostic_count,
         semantic_diagnostic_count == 1 ? "erro" : "erros");
     free(semantic_diagnostics);

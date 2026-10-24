@@ -918,7 +918,7 @@ def main():
             output_lines.append(
                 f"Análise semântica concluída: {count} {plural}; programa rejeitado."
             )
-            sys.stdout.write("\r\n".join(output_lines))
+            sys.stdout.write("\n".join(output_lines))
             return 4
         if ir_mode:
             code = IRGenerator(optimize).generate(syntax_tree)
