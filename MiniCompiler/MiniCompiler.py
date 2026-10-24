@@ -12,6 +12,7 @@ except ImportError:
     from scanner import Diagnostic, Scanner, Token, TYPES, tokenize
 
 
+# Exceção interna do parser: a CLI depois converte-a em diagnóstico com posição.
 class ParseError(Exception):
     def __init__(self, message, token):
         self.message = message
@@ -19,6 +20,7 @@ class ParseError(Exception):
         super().__init__(str(Diagnostic(message, token, "syntactic")))
 
 
+# Os campos de `values` variam por tag; cada produção documenta essa forma ao criar o nó.
 @dataclass
 class AstNode:
     tag: str
@@ -64,6 +66,7 @@ class Parser:
         return self.expect(self.current_token.kind).text
 
     def parse(self):
+        # Continua após erros recuperáveis para poder reportar mais de um problema.
         nodes = []
         while self.current_token.kind != "EOF":
             try:
@@ -218,6 +221,7 @@ class Parser:
         return self.parse_assignment()
 
     def parse_assignment(self):
+        # A atribuição é analisada por último e recursivamente à direita (a = b = c).
         left_expression = self.parse_binary_operation(self.parse_logical_or, ())
         if self.consume("="):
             return AstNode("Assign", (left_expression, self.parse_assignment()), left_expression.line, left_expression.column)
@@ -235,6 +239,8 @@ class Parser:
             )
         return left_expression
 
+    # A cadeia de chamadas abaixo codifica a precedência: ||, &&, igualdade,
+    # comparação, soma, multiplicação e, por fim, operadores unários.
     def parse_logical_or(self):
         return self.parse_binary_operation(self.parse_logical_and, ("||",))
 
@@ -348,6 +354,7 @@ class SemanticAnalyzer:
         return self.errors
 
     def push_scope(self):
+        # Cada dicionário é um escopo; a busca começa no bloco mais interno.
         self.scopes.append({})
 
     def pop_scope(self):
@@ -406,6 +413,7 @@ class SemanticAnalyzer:
         return ""
 
     def check_function(self, node):
+        # Parâmetros vivem no escopo da função; o corpo reaproveita esse escopo.
         return_type, name, parameters, body = node.values
         self.current_function = (return_type, name)
         self.push_scope()
@@ -516,6 +524,7 @@ class SemanticAnalyzer:
                    f"“{self.expression_text(node)}” não designa uma variável ou elemento de vetor.", node)
         return None
 
+    # Retorna o tipo da expressão; "error" impede cascatas de diagnósticos.
     def check_expression(self, node, value_required=True):
         if node is None:
             return "void"
@@ -613,6 +622,7 @@ class SemanticAnalyzer:
                        f"da função “{name}”; conversão implícita de {self.type_text(actual)} para {return_type} não permitida.",
                        returned or node)
 
+    # Usado para rejeitar funções não void cujo fluxo pode chegar ao fim.
     def definitely_returns(self, node):
         if node.tag == "Return":
             return True
@@ -756,6 +766,7 @@ def format_ast(tree, source=""):
 
 class IRGenerator:
     """Emissor didático de código de três endereços."""
+    # O estado de temporários, rótulos e constantes é reiniciado por função.
     def __init__(self, optimize=False): self.code, self.temp, self.label, self.loop_stack, self.optimize, self.constants = [], 0, 0, [], optimize, {}
     def new_temp(self): self.temp += 1; return f"t{self.temp}"
     def new_label(self): self.label += 1; return f"L{self.label}"
@@ -809,6 +820,7 @@ class IRGenerator:
         elif tag == "Return":
             value = node.values[0]; self.code.append("return" if value is None else f"return {self.emit_expr(value)}")
         elif tag == "If":
+            # Só elimina o desvio quando a condição foi reduzida a um valor conhecido.
             cond, yes, no = node.values
             value = self.emit_expr(cond)
             truth = None
@@ -838,6 +850,7 @@ class IRGenerator:
             self.constants.clear()
             self.code.append(end + ":")
         elif tag in ("While", "For"):
+            # Valores atribuídos dentro de um laço não são constantes invariantes.
             if tag == "While": init, cond, update, body = None, node.values[0], None, node.values[1]
             else: init, cond, update, body = node.values
             if init:
@@ -886,6 +899,7 @@ def main():
         tokens = scanner.scan()
         parser = Parser(tokens)
         syntax_tree = parser.parse()
+        # Mantém diagnósticos léxicos e sintáticos juntos para ordenação/emissão.
         diagnostics = scanner.errors + parser.errors
         if diagnostics:
             if diagnostics_mode:

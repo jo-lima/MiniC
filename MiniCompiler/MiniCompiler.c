@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 
+/* Categorias de tokens; operadores e pontuação usam o mesmo enum. */
 typedef enum {
   TOKEN_EOF, TOKEN_IDENTIFIER, TOKEN_INTEGER_LITERAL, TOKEN_REAL_LITERAL,
   TOKEN_INT, TOKEN_FLOAT, TOKEN_BOOL, TOKEN_VOID, TOKEN_RETURN, TOKEN_IF,
@@ -46,6 +47,8 @@ typedef enum {
   AST_WHILE, AST_FOR, AST_BREAK, AST_CONTINUE, AST_RETURN, AST_EXPRESSION, AST_ASSIGNMENT, AST_BINARY,
   AST_UNARY, AST_CALL, AST_INDEX, AST_IDENTIFIER, AST_LITERAL
 } AstTag;
+/* Nós compartilham um formato compacto: filhos fixos para estruturas e
+   uma lista dinâmica para declarações, parâmetros, argumentos e blocos. */
 typedef struct AstNode AstNode;
 struct AstNode {
   AstTag tag;
@@ -77,6 +80,7 @@ static char *duplicate_text(const char *source, size_t length) {
   return duplicated_text;
 }
 
+/* Registra o erro na posição do token atual sem interromper a tokenização. */
 static void mark_error(Tokens *tokens, const char *phase, const char *message) {
   if (tokens->diagnostic_count == tokens->diagnostic_capacity) {
     tokens->diagnostic_capacity = tokens->diagnostic_capacity
@@ -127,6 +131,7 @@ static TokenKind keyword_kind(const char *keyword_text) {
   if (!strcmp(keyword_text, "false")) return TOKEN_FALSE;
   return TOKEN_IDENTIFIER;
 }
+/* Converte o texto em tokens e acumula erros lexicais para a etapa seguinte. */
 static Tokens tokenize(const char *source) {
   Tokens token_list = {0};
   int line_number = 1;
@@ -267,6 +272,7 @@ static int expect_token(Tokens *tokens, TokenKind expected_kind) {
   return 0;
 }
 
+/* Recuperação: avança até ;, } ou EOF para continuar analisando o restante. */
 static void synchronize(Tokens *tokens, int consume_right_brace) {
   while (current_token(tokens)->kind != TOKEN_EOF
       && current_token(tokens)->kind != TOKEN_SEMICOLON
@@ -609,6 +615,8 @@ static AstNode *parse_unary_expression(Tokens *tokens) {
   return parse_postfix_expression(tokens);
 }
 
+/* Reutilizado por cada nível de precedência; acumular à esquerda dá
+   associatividade à esquerda para operadores binários. */
 static AstNode *parse_binary_expression(
     Tokens *tokens, AstNode *(*parse_operand)(Tokens *),
     const TokenKind *operators, int operator_count) {
@@ -633,6 +641,7 @@ static AstNode *parse_binary_expression(
   }
 }
 
+/* A ordem destas funções define a precedência dos operadores. */
 static AstNode *parse_multiplication(Tokens *tokens) {
   const TokenKind operators[] = {TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_MODULO};
   return parse_binary_expression(tokens, parse_unary_expression, operators, 3);
@@ -700,6 +709,7 @@ static AstNode *parse_program(Tokens *tokens) {
   return program;
 }
 
+/* Tipos semânticos separados dos tokens: vetores guardam também o tipo base. */
 typedef enum {
   SEM_TYPE_ERROR, SEM_TYPE_VOID, SEM_TYPE_INT, SEM_TYPE_FLOAT, SEM_TYPE_BOOL,
   SEM_TYPE_INT_ARRAY, SEM_TYPE_FLOAT_ARRAY, SEM_TYPE_BOOL_ARRAY
@@ -806,6 +816,7 @@ static void semantic_error(
   diagnostic->column = column;
 }
 
+/* Escopos são empilhados ao entrar em função/bloco e removidos ao sair. */
 static void semantic_push_scope(SemanticAnalyzer *analyzer) {
   analyzer->scopes = realloc(
       analyzer->scopes,
@@ -823,6 +834,7 @@ static void semantic_pop_scope(SemanticAnalyzer *analyzer) {
   analyzer->scope_count--;
 }
 
+/* Procura primeiro no escopo atual e depois nos escopos externos (sombreamento). */
 static SemanticSymbol *semantic_resolve(
     SemanticAnalyzer *analyzer, const char *name) {
   for (int scope_index = analyzer->scope_count - 1; scope_index >= 0;
@@ -1185,6 +1197,7 @@ static void semantic_statement(SemanticAnalyzer *analyzer, AstNode *node) {
   }
 }
 
+/* Análise conservadora: um if só garante retorno quando os dois ramos retornam. */
 static int definitely_returns(AstNode *node) {
   if (!node) return 0;
   if (node->tag == AST_RETURN) return 1;
@@ -1247,6 +1260,7 @@ static void analyze_semantics(
   free(analyzer.scopes);
 }
 
+/* Serializa a AST em formato textual usado pelas ferramentas de diagnóstico. */
 static void serialize_ast(Str *buffer, const AstNode *node) {
   char literal_text[64];
   if (!node) {
@@ -1460,6 +1474,7 @@ static void format_output(AstNode *program, const char *source, Str *output) {
 static int ir_label = 0, ir_loop_depth = 0, ir_break_targets[128], ir_continue_targets[128];
 static int ir_optimize = 0, ir_constant_count = 0, ir_scope_depth = 0;
 static char *ir_constant_names[256], *ir_constant_values[256];
+/* A tabela simples de constantes serve à otimização local da IR. */
 static const char *ir_lookup_constant(const char *name) {
   if (!ir_optimize) return NULL;
   for (int index = ir_constant_count - 1; index >= 0; index--) if (!strcmp(ir_constant_names[index], name)) return ir_constant_values[index];
@@ -1498,6 +1513,7 @@ static char *ir_render_expr(const AstNode *node) {
   if (node->tag == AST_UNARY) { char *operand = ir_render_expr(node->first_child); Str text = {0}; append_text(&text, node->first_text); append_text(&text, operand); free(operand); return text.text; }
   return semantic_expression_text(node);
 }
+/* Registra valores literais; uma atribuição não literal invalida o nome. */
 static void ir_record_constant(const char *name, const char *value) {
   if (!ir_optimize) return;
   double ignored;
@@ -1558,6 +1574,7 @@ static void emit_ir_statement(AstNode *node) {
       if (node->third_child) { emit_ir_statement(node->third_child); printf("L%d:\n", end); }
       ir_constant_count = 0;
     } else {
+      /* Laços podem reatribuir valores a cada iteração: não propagar constantes neles. */
       int saved_optimize = ir_optimize; ir_optimize = 0;
       int head = ++ir_label, exit = ++ir_label, update = node->tag == AST_FOR ? ++ir_label : head;
       if (node->tag == AST_FOR && node->first_child) printf("  %s\n", semantic_expression_text(node->first_child));
@@ -1592,6 +1609,7 @@ static void emit_ir(AstNode *program, int optimize) {
   }
 }
 
+/* CLI: lê opções/arquivo e coordena scanner, parser, análise e emissão. */
 int main(int argument_count, char **arguments) {
   const char *source_path = NULL;
   int diagnostics_mode = 0, ir_mode = 0, optimize = 0;

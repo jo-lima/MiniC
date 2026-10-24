@@ -21,6 +21,7 @@ class Diagnostic:
         return f"{prefix}: {self.message} (linha {self.token.line}, coluna {self.token.column})"
 
 
+# Palavras reservadas mantêm seu próprio tipo de token; os demais nomes são IDENT.
 KEYWORDS = {
     "int", "float", "bool", "void", "return", "if", "else", "while",
     "true", "false", "for", "break", "continue", "print", "read", "char",
@@ -36,6 +37,7 @@ class Scanner:
         self.errors = []
 
     def scan(self):
+        # A posição é guardada no início de cada token para diagnósticos posteriores.
         tokens = []
         source_index = 0
         line_number = 1
@@ -58,6 +60,7 @@ class Scanner:
                 source_index += 1
                 continue
 
+            # Comentários são ignorados, mas sua extensão ainda atualiza linha/coluna.
             if self.source.startswith("//", source_index):
                 end_index = self.source.find("\n", source_index)
                 end_index = len(self.source) if end_index < 0 else end_index
@@ -131,6 +134,7 @@ class Scanner:
             update_position(self.source[source_index:end_index])
             source_index = end_index
 
+        # O EOF sentinela simplifica o parser: sempre há um token corrente válido.
         tokens.append(Token("EOF", "", line_number, column_number))
         return tokens
 
