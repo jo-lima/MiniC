@@ -23,9 +23,9 @@ class Diagnostic:
 
 KEYWORDS = {
     "int", "float", "bool", "void", "return", "if", "else", "while",
-    "true", "false",
+    "true", "false", "for", "break", "continue", "print", "read", "char",
 }
-TYPES = {"int", "float", "bool", "void"}
+TYPES = {"int", "float", "bool", "void", "char"}
 
 
 class Scanner:
@@ -114,7 +114,7 @@ class Scanner:
                      if self.source.startswith(operator, source_index)),
                     current_character,
                 )
-                valid_single = set("+-*/=<>!;,:(){}[]")
+                valid_single = set("+-*/%=<>!;,:(){}[]")
                 if token_text not in valid_single and token_text not in operators:
                     self.errors.append(Diagnostic(
                         f"caractere inválido {current_character!r}",

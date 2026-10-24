@@ -172,6 +172,32 @@ class Parser:
             if self.current_token.kind in ("}", "EOF"):
                 raise ParseError("esperado início de statement", self.current_token)
             return AstNode("While", (condition, self.parse_statement()), condition.line, condition.column)
+        if token_kind == "for":
+            loop_token = self.current_token
+            self.token_index += 1
+            self.expect("(", "ABRE_PAREN")
+            if self.current_token.kind == ";":
+                init = None
+            elif self.current_token.kind in TYPES:
+                type_token = self.current_token
+                variable_type = self.parse_type(False)
+                name_token = self.expect("IDENT", "IDENT")
+                initializer = None
+                if self.consume("="): initializer = self.parse_expression()
+                init = AstNode("VarDecl", (variable_type, name_token.text, None, initializer), type_token.line, type_token.column)
+            else:
+                init = self.parse_expression()
+            self.expect(";", "PONTO_E_VIRGULA")
+            condition = None if self.current_token.kind == ";" else self.parse_expression()
+            self.expect(";", "PONTO_E_VIRGULA")
+            update = None if self.current_token.kind == ")" else self.parse_expression()
+            self.expect(")", "FECHA_PAREN")
+            return AstNode("For", (init, condition, update, self.parse_statement()), loop_token.line, loop_token.column)
+        if token_kind in ("break", "continue"):
+            jump = self.current_token
+            self.token_index += 1
+            self.expect(";", "PONTO_E_VIRGULA")
+            return AstNode(jump.kind.title(), (), jump.line, jump.column)
         if token_kind == "return":
             return_token = self.current_token
             self.token_index += 1
@@ -259,6 +285,9 @@ class Parser:
 
     def parse_primary(self):
         current_token = self.current_token
+        if current_token.kind in ("print", "read"):
+            self.token_index += 1
+            return AstNode("Id", (current_token.text,), current_token.line, current_token.column)
         if self.consume("IDENT"):
             return AstNode("Id", (current_token.text,), current_token.line, current_token.column)
         if self.consume("INT"):
@@ -435,7 +464,24 @@ class SemanticAnalyzer:
         elif node.tag == "While":
             condition, body = node.values
             self.require_bool(condition)
+            self.loop_depth = getattr(self, "loop_depth", 0) + 1
             self.check_statement(body)
+            self.loop_depth -= 1
+        elif node.tag == "For":
+            init, condition, update, body = node.values
+            self.push_scope()
+            if init is not None:
+                if init.tag == "VarDecl": self.check_declaration(init)
+                else: self.check_expression(init, value_required=False)
+            if condition is not None: self.require_bool(condition)
+            self.loop_depth = getattr(self, "loop_depth", 0) + 1
+            self.check_statement(body)
+            self.loop_depth -= 1
+            if update is not None: self.check_expression(update, value_required=False)
+            self.pop_scope()
+        elif node.tag in ("Break", "Continue"):
+            if not getattr(self, "loop_depth", 0):
+                self.error("SEM014", f"{node.tag.lower()} fora de laço.", node)
         elif node.tag == "Return":
             self.check_return(node)
 
@@ -498,16 +544,30 @@ class SemanticAnalyzer:
             right_type = self.check_expression(right)
             if operator in ("&&", "||"):
                 return "bool" if left_type == right_type == "bool" else "error"
+            if operator == "%":
+                return "int" if left_type == right_type == "int" else "error"
             if operator in ("<", "<=", ">", ">="):
                 return "bool" if self.is_numeric(left_type) and self.is_numeric(right_type) else "error"
             if operator in ("==", "!="):
                 return "bool" if self.compatible(left_type, right_type) or self.compatible(right_type, left_type) else "error"
             if self.is_numeric(left_type) and self.is_numeric(right_type):
                 return "float" if "float" in (left_type, right_type) else "int"
+            if left_type not in ("error", "void") and right_type not in ("error", "void"):
+                self.error("SEM004", f"Operador {operator} incompatível com operandos {self.type_text(left_type)} e {self.type_text(right_type)}.", node)
             return "error"
         if node.tag == "Call":
             function, arguments = node.values
             name = function.values[0] if function.tag == "Id" else ""
+            if name == "print":
+                if len(arguments) != 1:
+                    self.error("SEM007", "print espera exatamente um argumento.", node)
+                for argument in arguments:
+                    self.check_expression(argument)
+                return "void"
+            if name == "read":
+                if arguments:
+                    self.error("SEM007", "read não recebe argumentos.", node)
+                return "int"
             signature = self.functions.get(name)
             if signature is None:
                 self.check_expression(function)
@@ -561,6 +621,8 @@ class SemanticAnalyzer:
         if node.tag == "If":
             return (self.definitely_returns(node.values[1]) and node.values[2] is not None
                     and self.definitely_returns(node.values[2]))
+        if node.tag == "For":
+            return node.values[1] is not None and node.values[1].tag == "Lit" and node.values[1].values[1] == "true" and self.definitely_returns(node.values[3])
         return False
 
 
@@ -692,12 +754,99 @@ def format_ast(tree, source=""):
             serialized_text = serialized_text.replace(")))), Return", "))))), Return", 1)
     return serialized_text
 
+class IRGenerator:
+    """Emissor didático de código de três endereços."""
+    def __init__(self, optimize=False): self.code, self.temp, self.label, self.loop_stack, self.optimize, self.constants = [], 0, 0, [], optimize, {}
+    def new_temp(self): self.temp += 1; return f"t{self.temp}"
+    def new_label(self): self.label += 1; return f"L{self.label}"
+    def emit_expr(self, node):
+        if node.tag == "Id": return self.constants.get(node.values[0], node.values[0]) if self.optimize else node.values[0]
+        if node.tag == "Lit": return node.values[1]
+        if node.tag == "Index":
+            arr, idx = node.values; i = self.emit_expr(idx); t = self.new_temp(); self.code.append(f"{t} = {arr.values[0]}[{i}]"); return t
+        if node.tag == "Call":
+            fn, args = node.values; values = [self.emit_expr(a) for a in args]
+            if fn.tag == "Id" and fn.values[0] == "print": self.code.append(f"print {values[0] if values else ''}"); return "0"
+            for value in values: self.code.append(f"param {value}")
+            t = self.new_temp(); self.code.append(f"{t} = call {fn.values[0]}, {len(values)}"); return t
+        if node.tag == "Assign":
+            left, right = node.values; value = self.emit_expr(right)
+            if left.tag == "Index":
+                arr, idx = left.values; i = self.emit_expr(idx); self.code.append(f"{arr.values[0]}[{i}] = {value}")
+            else:
+                name = left.values[0]; self.code.append(f"{name} = {value}")
+                if self.optimize:
+                    if value.lstrip("-").replace(".", "", 1).isdigit() or value in ("true", "false"): self.constants[name] = value
+                    else: self.constants.pop(name, None)
+            return left.values[0]
+        if node.tag == "Unary":
+            op, value = node.values; operand = self.emit_expr(value); t = self.new_temp(); self.code.append(f"{t} = {op}{operand}"); return t
+        if node.tag == "Binary":
+            op, left, right = node.values; a = self.emit_expr(left); b = self.emit_expr(right)
+            if self.optimize and a.lstrip("-").replace(".", "", 1).isdigit() and b.lstrip("-").replace(".", "", 1).isdigit():
+                x, y = float(a) if "." in a else int(a), float(b) if "." in b else int(b)
+                try:
+                    result = {"+": lambda: x+y, "-": lambda: x-y, "*": lambda: x*y, "/": lambda: x/y, "%": lambda: x%y, "<": lambda: x<y, "<=": lambda: x<=y, ">": lambda: x>y, ">=": lambda: x>=y, "==": lambda: x==y, "!=": lambda: x!=y}[op]()
+                    return str(result).lower() if isinstance(result, bool) else str(int(result) if isinstance(result, float) and result.is_integer() else result)
+                except (ZeroDivisionError, KeyError): pass
+            if self.optimize and op in ("+", "-") and b == "0": return a
+            if self.optimize and op in ("*", "/") and b == "1": return a
+            t = self.new_temp(); self.code.append(f"{t} = {a} {op} {b}"); return t
+        return "0"
+    def emit_stmt(self, node):
+        tag = node.tag
+        if tag == "Block":
+            for child in node.values: self.emit_stmt(child)
+        elif tag == "VarDecl":
+            typ, name, size, init = node.values
+            if size is not None: self.code.append(f"var {name}[{self.emit_expr(size)}]")
+            if init is not None: self.emit_expr(AstNode("Assign", (AstNode("Id", (name,)), init)))
+        elif tag == "ExprStmt": self.emit_expr(node.values[0])
+        elif tag == "Assign": self.emit_expr(node)
+        elif tag == "Return":
+            value = node.values[0]; self.code.append("return" if value is None else f"return {self.emit_expr(value)}")
+        elif tag == "If":
+            cond, yes, no = node.values; otherwise, end = self.new_label(), self.new_label(); value = self.emit_expr(cond)
+            self.code.append(f"ifFalse {value} goto {otherwise}"); self.emit_stmt(yes); self.code.append(f"goto {end}"); self.code.append(otherwise + ":")
+            if no: self.emit_stmt(no)
+            self.code.append(end + ":")
+        elif tag in ("While", "For"):
+            if tag == "While": init, cond, update, body = None, node.values[0], None, node.values[1]
+            else: init, cond, update, body = node.values
+            if init:
+                if init.tag == "VarDecl": self.emit_stmt(init)
+                else: self.emit_expr(init)
+            head, end = self.new_label(), self.new_label(); update_label = self.new_label() if update else head
+            self.loop_stack.append((update_label, end)); self.code.append(head + ":")
+            if cond: self.code.append(f"ifFalse {self.emit_expr(cond)} goto {end}")
+            self.emit_stmt(body)
+            if update:
+                self.code.append(update_label + ":"); self.emit_expr(update)
+            self.code.append(f"goto {head}"); self.code.append(end + ":"); self.loop_stack.pop()
+        elif tag == "Break" and self.loop_stack: self.code.append(f"goto {self.loop_stack[-1][1]}")
+        elif tag == "Continue" and self.loop_stack: self.code.append(f"goto {self.loop_stack[-1][0]}")
+    def generate(self, tree):
+        for node in tree.values:
+            if node.tag == "Function":
+                typ, name, params, body = node.values
+                self.constants.clear()
+                self.code.append(f"func {name}({', '.join(p[1] for p in params)})" if params else f"func {name}")
+                self.emit_stmt(body)
+                self.code.append("endfunc")
+        return self.code
+
+
 def main():
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--diagnostics"):
-        print(f"Uso: {sys.argv[0]} codigo.c [--diagnostics]", file=sys.stderr)
+    args = sys.argv[1:]
+    diagnostics_mode = "--diagnostics" in args
+    ir_mode = "--ir" in args
+    optimize = "-O1" in args
+    files = [arg for arg in args if not arg.startswith("-")]
+    if len(files) != 1 or any(a not in ("--diagnostics", "--ir", "-O0", "-O1") for a in args if a.startswith("-")):
+        print(f"Uso: {sys.argv[0]} [-O0|-O1] [--ir] codigo.c [--diagnostics]", file=sys.stderr)
         return 2
     try:
-        with open(sys.argv[1], encoding="utf8") as source_file:
+        with open(files[0], encoding="utf8") as source_file:
             source_code = source_file.read()
         scanner = Scanner(source_code)
         tokens = scanner.scan()
@@ -705,7 +854,7 @@ def main():
         syntax_tree = parser.parse()
         diagnostics = scanner.errors + parser.errors
         if diagnostics:
-            if len(sys.argv) == 3:
+            if diagnostics_mode:
                 for diagnostic in diagnostics:
                     print(diagnostic, file=sys.stderr)
             print('NÃO HÁ AST: o parser deve rejeitar a entrada.')
@@ -723,7 +872,11 @@ def main():
             )
             sys.stdout.write("\r\n".join(output_lines))
             return 1
-        sys.stdout.write("Análise semântica concluída: 0 erros; programa aceito.")
+        if ir_mode:
+            code = IRGenerator(optimize).generate(syntax_tree)
+            sys.stdout.write("\n".join(code) + "\n")
+        else:
+            sys.stdout.write("Análise semântica concluída: 0 erros; programa aceito.")
     except OSError as operating_system_error:
         print(f"Erro: {operating_system_error}", file=sys.stderr)
         return 2
