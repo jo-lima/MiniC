@@ -796,7 +796,10 @@ class IRGenerator:
     def emit_stmt(self, node):
         tag = node.tag
         if tag == "Block":
-            for child in node.values: self.emit_stmt(child)
+            for child in node.values:
+                self.emit_stmt(child)
+                if child.tag == "Return":
+                    break
         elif tag == "VarDecl":
             typ, name, size, init = node.values
             if size is not None: self.code.append(f"var {name}[{self.emit_expr(size)}]")
@@ -806,9 +809,33 @@ class IRGenerator:
         elif tag == "Return":
             value = node.values[0]; self.code.append("return" if value is None else f"return {self.emit_expr(value)}")
         elif tag == "If":
-            cond, yes, no = node.values; otherwise, end = self.new_label(), self.new_label(); value = self.emit_expr(cond)
-            self.code.append(f"ifFalse {value} goto {otherwise}"); self.emit_stmt(yes); self.code.append(f"goto {end}"); self.code.append(otherwise + ":")
+            cond, yes, no = node.values
+            value = self.emit_expr(cond)
+            truth = None
+            if value in ("true", "false"):
+                truth = value == "true"
+            else:
+                try:
+                    truth = float(value) != 0
+                except ValueError:
+                    pass
+            if self.optimize and truth is not None:
+                if truth:
+                    self.emit_stmt(yes)
+                elif no:
+                    self.emit_stmt(no)
+                return
+
+            otherwise, end = self.new_label(), self.new_label()
+            self.code.append(f"ifFalse {value} goto {otherwise}")
+            saved_constants = self.constants.copy()
+            self.constants.clear()
+            self.emit_stmt(yes)
+            self.code.append(f"goto {end}")
+            self.code.append(otherwise + ":")
+            self.constants = saved_constants.copy()
             if no: self.emit_stmt(no)
+            self.constants.clear()
             self.code.append(end + ":")
         elif tag in ("While", "For"):
             if tag == "While": init, cond, update, body = None, node.values[0], None, node.values[1]
@@ -816,6 +843,11 @@ class IRGenerator:
             if init:
                 if init.tag == "VarDecl": self.emit_stmt(init)
                 else: self.emit_expr(init)
+            saved_optimize = self.optimize
+            if self.optimize:
+                # Values assigned in a loop can change on every iteration.
+                self.constants.clear()
+                self.optimize = False
             head, end = self.new_label(), self.new_label(); update_label = self.new_label() if update else head
             self.loop_stack.append((update_label, end)); self.code.append(head + ":")
             if cond: self.code.append(f"ifFalse {self.emit_expr(cond)} goto {end}")
@@ -823,6 +855,8 @@ class IRGenerator:
             if update:
                 self.code.append(update_label + ":"); self.emit_expr(update)
             self.code.append(f"goto {head}"); self.code.append(end + ":"); self.loop_stack.pop()
+            self.optimize = saved_optimize
+            if saved_optimize: self.constants.clear()
         elif tag == "Break" and self.loop_stack: self.code.append(f"goto {self.loop_stack[-1][1]}")
         elif tag == "Continue" and self.loop_stack: self.code.append(f"goto {self.loop_stack[-1][0]}")
     def generate(self, tree):
@@ -858,7 +892,7 @@ def main():
                 for diagnostic in diagnostics:
                     print(diagnostic, file=sys.stderr)
             print('NÃO HÁ AST: o parser deve rejeitar a entrada.')
-            return 1
+            return 2 if any(d.phase == "lexical" for d in diagnostics) else 3
         semantic_errors = SemanticAnalyzer(syntax_tree).analyze()
         if semantic_errors:
             count = len(semantic_errors)
@@ -871,7 +905,7 @@ def main():
                 f"Análise semântica concluída: {count} {plural}; programa rejeitado."
             )
             sys.stdout.write("\r\n".join(output_lines))
-            return 1
+            return 4
         if ir_mode:
             code = IRGenerator(optimize).generate(syntax_tree)
             sys.stdout.write("\n".join(code) + "\n")

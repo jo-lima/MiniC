@@ -1511,7 +1511,10 @@ static void emit_ir_statement(AstNode *node) {
   if (!node) return;
   if (node->tag == AST_BLOCK) {
     int nested = ir_scope_depth++ > 0;
-    for (int index = 0; index < node->child_count; index++) emit_ir_statement(node->children[index]);
+    for (int index = 0; index < node->child_count; index++) {
+      emit_ir_statement(node->children[index]);
+      if (node->children[index]->tag == AST_RETURN) break;
+    }
     ir_scope_depth--;
     if (nested) ir_constant_count = 0;
   } else if (node->tag == AST_VARIABLE_DECLARATION) {
@@ -1530,11 +1533,28 @@ static void emit_ir_statement(AstNode *node) {
   } else if (node->tag == AST_IF || node->tag == AST_WHILE || node->tag == AST_FOR) {
     AstNode *condition = node->tag == AST_IF ? node->first_child : (node->tag == AST_WHILE ? node->first_child : node->second_child);
     if (node->tag == AST_IF) {
+      char *test = ir_render_expr(condition);
+      if (ir_optimize) {
+        int known = 0, truth = 0;
+        double number = 0;
+        if (!strcmp(test, "true")) { known = 1; truth = 1; }
+        else if (!strcmp(test, "false")) { known = 1; truth = 0; }
+        else if (ir_is_number(test, &number)) { known = 1; truth = number != 0; }
+        if (known) {
+          free(test);
+          ir_constant_count = 0;
+          emit_ir_statement(truth ? node->second_child : node->third_child);
+          ir_constant_count = 0;
+          return;
+        }
+      }
       int otherwise = ++ir_label, end = node->third_child ? ++ir_label : otherwise;
-      char *test = ir_render_expr(condition); printf("  ifFalse %s goto L%d\n", test, otherwise); free(test);
+      printf("  ifFalse %s goto L%d\n", test, otherwise); free(test);
+      ir_constant_count = 0;
       emit_ir_statement(node->second_child);
       if (node->third_child) printf("  goto L%d\n", end);
       printf("L%d:\n", otherwise);
+      ir_constant_count = 0;
       if (node->third_child) { emit_ir_statement(node->third_child); printf("L%d:\n", end); }
       ir_constant_count = 0;
     } else {
@@ -1592,19 +1612,24 @@ int main(int argument_count, char **arguments) {
   Tokens tokens = tokenize(source);
   AstNode *program = parse_program(&tokens);
   if (tokens.diagnostic_count) {
+    int error_code = 3;
     if (diagnostics_mode) {
       for (int index = 0; index < tokens.diagnostic_count; index++) {
         Diagnostic *diagnostic = &tokens.diagnostics[index];
+        if (!strcmp(diagnostic->phase, "lexical")) error_code = 2;
         fprintf(stderr, "Erro %s: %s (linha %d, coluna %d)\n",
                 diagnostic->phase, diagnostic->message,
                 diagnostic->line, diagnostic->column);
       }
+    } else {
+      for (int index = 0; index < tokens.diagnostic_count; index++)
+        if (!strcmp(tokens.diagnostics[index].phase, "lexical")) error_code = 2;
     }
     puts("NÃO HÁ AST: o parser deve rejeitar a entrada.");
     free_ast(program);
     free_tokens(&tokens);
     free(source);
-    return 1;
+    return error_code;
   }
 
   SemanticDiagnostic *semantic_diagnostics = NULL;
@@ -1627,7 +1652,7 @@ int main(int argument_count, char **arguments) {
     free_ast(program);
     free_tokens(&tokens);
     free(source);
-    return 1;
+    return 4;
   }
   free(semantic_diagnostics);
   if (ir_mode) emit_ir(program, optimize);
