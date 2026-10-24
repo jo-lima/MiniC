@@ -4,12 +4,14 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 
 typedef enum {
   TOKEN_EOF, TOKEN_IDENTIFIER, TOKEN_INTEGER_LITERAL, TOKEN_REAL_LITERAL,
   TOKEN_INT, TOKEN_FLOAT, TOKEN_BOOL, TOKEN_VOID, TOKEN_RETURN, TOKEN_IF,
-  TOKEN_ELSE, TOKEN_WHILE, TOKEN_TRUE, TOKEN_FALSE,
-  TOKEN_PLUS, TOKEN_MINUS, TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_ASSIGN,
+  TOKEN_ELSE, TOKEN_WHILE, TOKEN_TRUE, TOKEN_FALSE, TOKEN_FOR, TOKEN_BREAK,
+  TOKEN_CONTINUE, TOKEN_PRINT, TOKEN_READ, TOKEN_CHAR,
+  TOKEN_PLUS, TOKEN_MINUS, TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_MODULO, TOKEN_ASSIGN,
   TOKEN_LESS_THAN, TOKEN_GREATER_THAN, TOKEN_NOT, TOKEN_LESS_EQUAL,
   TOKEN_GREATER_EQUAL, TOKEN_EQUAL, TOKEN_NOT_EQUAL, TOKEN_AND, TOKEN_OR,
   TOKEN_SEMICOLON, TOKEN_COMMA, TOKEN_LEFT_PARENTHESIS,
@@ -41,7 +43,7 @@ typedef struct Diagnostic {
 } Diagnostic;
 typedef enum {
   AST_PROGRAM, AST_FUNCTION, AST_BLOCK, AST_VARIABLE_DECLARATION, AST_IF,
-  AST_WHILE, AST_RETURN, AST_EXPRESSION, AST_ASSIGNMENT, AST_BINARY,
+  AST_WHILE, AST_FOR, AST_BREAK, AST_CONTINUE, AST_RETURN, AST_EXPRESSION, AST_ASSIGNMENT, AST_BINARY,
   AST_UNARY, AST_CALL, AST_INDEX, AST_IDENTIFIER, AST_LITERAL
 } AstTag;
 typedef struct AstNode AstNode;
@@ -115,6 +117,12 @@ static TokenKind keyword_kind(const char *keyword_text) {
   if (!strcmp(keyword_text, "if")) return TOKEN_IF;
   if (!strcmp(keyword_text, "else")) return TOKEN_ELSE;
   if (!strcmp(keyword_text, "while")) return TOKEN_WHILE;
+  if (!strcmp(keyword_text, "for")) return TOKEN_FOR;
+  if (!strcmp(keyword_text, "break")) return TOKEN_BREAK;
+  if (!strcmp(keyword_text, "continue")) return TOKEN_CONTINUE;
+  if (!strcmp(keyword_text, "print")) return TOKEN_PRINT;
+  if (!strcmp(keyword_text, "read")) return TOKEN_READ;
+  if (!strcmp(keyword_text, "char")) return TOKEN_CHAR;
   if (!strcmp(keyword_text, "true")) return TOKEN_TRUE;
   if (!strcmp(keyword_text, "false")) return TOKEN_FALSE;
   return TOKEN_IDENTIFIER;
@@ -215,6 +223,7 @@ static Tokens tokenize(const char *source) {
       case '-': token_kind = TOKEN_MINUS; break;
       case '*': token_kind = TOKEN_MULTIPLY; break;
       case '/': token_kind = TOKEN_DIVIDE; break;
+      case '%': token_kind = TOKEN_MODULO; break;
       case '=': token_kind = TOKEN_ASSIGN; break;
       case '<': token_kind = TOKEN_LESS_THAN; break;
       case '>': token_kind = TOKEN_GREATER_THAN; break;
@@ -274,7 +283,7 @@ static void synchronize(Tokens *tokens, int consume_right_brace) {
 
 static int is_type(TokenKind token_kind) {
   return token_kind == TOKEN_INT || token_kind == TOKEN_FLOAT
-      || token_kind == TOKEN_BOOL || token_kind == TOKEN_VOID;
+      || token_kind == TOKEN_BOOL || token_kind == TOKEN_VOID || token_kind == TOKEN_CHAR;
 }
 
 static AstNode *create_node(AstTag tag) {
@@ -464,6 +473,26 @@ static AstNode *parse_statement(Tokens *tokens) {
     loop->second_child = parse_statement(tokens);
     return loop;
   }
+  if (consume_token(tokens, TOKEN_FOR)) {
+    AstNode *loop = create_node(AST_FOR);
+    expect_token(tokens, TOKEN_LEFT_PARENTHESIS);
+    if (current_token(tokens)->kind != TOKEN_SEMICOLON) loop->first_child = parse_expression(tokens);
+    expect_token(tokens, TOKEN_SEMICOLON);
+    if (current_token(tokens)->kind != TOKEN_SEMICOLON) loop->second_child = parse_expression(tokens);
+    expect_token(tokens, TOKEN_SEMICOLON);
+    if (current_token(tokens)->kind != TOKEN_RIGHT_PARENTHESIS) loop->third_child = parse_expression(tokens);
+    expect_token(tokens, TOKEN_RIGHT_PARENTHESIS);
+    append_child(loop, parse_statement(tokens));
+    return loop;
+  }
+  if (statement_kind == TOKEN_BREAK || statement_kind == TOKEN_CONTINUE) {
+    Token *jump_token = current_token(tokens);
+    tokens->current_index++;
+    AstNode *jump = create_node(statement_kind == TOKEN_BREAK ? AST_BREAK : AST_CONTINUE);
+    set_node_position(jump, jump_token);
+    expect_token(tokens, TOKEN_SEMICOLON);
+    return jump;
+  }
   if (consume_token(tokens, TOKEN_RETURN)) {
     Token *return_token = &tokens->tokens[tokens->current_index - 1];
     AstNode *return_statement = create_node(AST_RETURN);
@@ -488,6 +517,13 @@ static AstNode *parse_statement(Tokens *tokens) {
 
 static AstNode *parse_primary_expression(Tokens *tokens) {
   Token *token = current_token(tokens);
+  if (token->kind == TOKEN_PRINT || token->kind == TOKEN_READ) {
+    tokens->current_index++;
+    AstNode *identifier = create_node(AST_IDENTIFIER);
+    identifier->first_text = token->text;
+    set_node_position(identifier, token);
+    return identifier;
+  }
   if (consume_token(tokens, TOKEN_IDENTIFIER)) {
     AstNode *identifier = create_node(AST_IDENTIFIER);
     identifier->first_text = token->text;
@@ -598,8 +634,8 @@ static AstNode *parse_binary_expression(
 }
 
 static AstNode *parse_multiplication(Tokens *tokens) {
-  const TokenKind operators[] = {TOKEN_MULTIPLY, TOKEN_DIVIDE};
-  return parse_binary_expression(tokens, parse_unary_expression, operators, 2);
+  const TokenKind operators[] = {TOKEN_MULTIPLY, TOKEN_DIVIDE, TOKEN_MODULO};
+  return parse_binary_expression(tokens, parse_unary_expression, operators, 3);
 }
 
 static AstNode *parse_addition(Tokens *tokens) {
@@ -696,6 +732,7 @@ typedef struct {
   int diagnostic_count;
   int diagnostic_capacity;
   AstNode *current_function;
+  int loop_depth;
 } SemanticAnalyzer;
 
 static int is_numeric_type(SemanticType type) {
@@ -718,6 +755,7 @@ static SemanticType base_type(const char *type_name, int is_array) {
   if (!strcmp(type_name, "int")) return is_array ? SEM_TYPE_INT_ARRAY : SEM_TYPE_INT;
   if (!strcmp(type_name, "float")) return is_array ? SEM_TYPE_FLOAT_ARRAY : SEM_TYPE_FLOAT;
   if (!strcmp(type_name, "bool")) return is_array ? SEM_TYPE_BOOL_ARRAY : SEM_TYPE_BOOL;
+  if (!strcmp(type_name, "char")) return SEM_TYPE_INT;
   return SEM_TYPE_VOID;
 }
 
@@ -952,6 +990,8 @@ static SemanticType semantic_expression(
     if (!strcmp(node->first_text, "&&") || !strcmp(node->first_text, "||"))
       return left == SEM_TYPE_BOOL && right == SEM_TYPE_BOOL
           ? SEM_TYPE_BOOL : SEM_TYPE_ERROR;
+    if (!strcmp(node->first_text, "%"))
+      return left == SEM_TYPE_INT && right == SEM_TYPE_INT ? SEM_TYPE_INT : SEM_TYPE_ERROR;
     if (!strcmp(node->first_text, "<") || !strcmp(node->first_text, "<=")
         || !strcmp(node->first_text, ">") || !strcmp(node->first_text, ">="))
       return is_numeric_type(left) && is_numeric_type(right)
@@ -959,13 +999,27 @@ static SemanticType semantic_expression(
     if (!strcmp(node->first_text, "==") || !strcmp(node->first_text, "!="))
       return types_compatible(left, right) || types_compatible(right, left)
           ? SEM_TYPE_BOOL : SEM_TYPE_ERROR;
-    return is_numeric_type(left) && is_numeric_type(right)
-        ? (left == SEM_TYPE_FLOAT || right == SEM_TYPE_FLOAT
-            ? SEM_TYPE_FLOAT : SEM_TYPE_INT) : SEM_TYPE_ERROR;
+    if (is_numeric_type(left) && is_numeric_type(right))
+      return left == SEM_TYPE_FLOAT || right == SEM_TYPE_FLOAT ? SEM_TYPE_FLOAT : SEM_TYPE_INT;
+    if (left != SEM_TYPE_ERROR && right != SEM_TYPE_ERROR && left != SEM_TYPE_VOID && right != SEM_TYPE_VOID)
+      semantic_error(analyzer, "SEM004", node->line, node->column, "Operador %s incompatível com operandos %s e %s.", node->first_text, semantic_type_name(left), semantic_type_name(right));
+    return SEM_TYPE_ERROR;
   }
   if (node->tag == AST_CALL) {
     const char *name = node->first_child->tag == AST_IDENTIFIER
         ? node->first_child->first_text : "";
+    if (!strcmp(name, "print")) {
+      if (node->child_count != 1) semantic_error(analyzer, "SEM007", node->line, node->column, "print espera exatamente um argumento.");
+      for (int index = 0; index < node->child_count; index++) {
+        SemanticType argument_type = semantic_expression(analyzer, node->children[index], 1);
+        if (argument_type == SEM_TYPE_VOID) semantic_error(analyzer, "SEM012", node->children[index]->line, node->children[index]->column, "print requer uma expressão com valor.");
+      }
+      return SEM_TYPE_VOID;
+    }
+    if (!strcmp(name, "read")) {
+      if (node->child_count) semantic_error(analyzer, "SEM007", node->line, node->column, "read não recebe argumentos.");
+      return SEM_TYPE_INT;
+    }
     AstNode *function = NULL;
     for (int index = 0; index < analyzer->program->child_count; index++) {
       AstNode *candidate = analyzer->program->children[index];
@@ -1086,12 +1140,29 @@ static void semantic_statement(SemanticAnalyzer *analyzer, AstNode *node) {
             semantic_type_name(condition), text);
         free(text);
       }
+      if (node->tag == AST_WHILE) analyzer->loop_depth++;
       semantic_statement(analyzer, node->second_child);
+      if (node->tag == AST_WHILE) analyzer->loop_depth--;
       if (node->tag == AST_IF && node->third_child) {
         semantic_statement(analyzer, node->third_child);
       }
       break;
     }
+    case AST_FOR:
+      if (node->first_child) semantic_expression(analyzer, node->first_child, 0);
+      if (node->second_child) {
+        SemanticType condition = semantic_expression(analyzer, node->second_child, 1);
+        if (condition != SEM_TYPE_BOOL) semantic_error(analyzer, "SEM005", node->second_child->line, node->second_child->column, "Condição de for deve ter tipo bool.");
+      }
+      analyzer->loop_depth++;
+      if (node->child_count) semantic_statement(analyzer, node->children[0]);
+      analyzer->loop_depth--;
+      if (node->third_child) semantic_expression(analyzer, node->third_child, 0);
+      break;
+    case AST_BREAK:
+    case AST_CONTINUE:
+      if (!analyzer->loop_depth) semantic_error(analyzer, "SEM014", node->line, node->column, "%s fora de laço.", node->tag == AST_BREAK ? "break" : "continue");
+      break;
     case AST_RETURN: {
       SemanticType expected = base_type(
           analyzer->current_function->first_text, 0);
@@ -1238,6 +1309,14 @@ static void serialize_ast(Str *buffer, const AstNode *node) {
       append_text(buffer, "While("); serialize_ast(buffer, node->first_child);
       append_text(buffer, node->second_child->tag == AST_BLOCK ? "," : ", ");
       serialize_ast(buffer, node->second_child); append_text(buffer, ")"); break;
+    case AST_FOR:
+      append_text(buffer, "For("); serialize_ast(buffer, node->first_child);
+      append_text(buffer, ","); serialize_ast(buffer, node->second_child);
+      append_text(buffer, ","); serialize_ast(buffer, node->third_child);
+      if (node->child_count) { append_text(buffer, ","); serialize_ast(buffer, node->children[0]); }
+      append_text(buffer, ")"); break;
+    case AST_BREAK: append_text(buffer, "Break"); break;
+    case AST_CONTINUE: append_text(buffer, "Continue"); break;
     case AST_RETURN:
       append_text(buffer, "Return("); serialize_ast(buffer, node->first_child);
       append_text(buffer, ")"); break;
@@ -1378,19 +1457,142 @@ static void format_output(AstNode *program, const char *source, Str *output) {
   }
 }
 
+static int ir_label = 0, ir_loop_depth = 0, ir_break_targets[128], ir_continue_targets[128];
+static int ir_optimize = 0, ir_constant_count = 0, ir_scope_depth = 0;
+static char *ir_constant_names[256], *ir_constant_values[256];
+static const char *ir_lookup_constant(const char *name) {
+  if (!ir_optimize) return NULL;
+  for (int index = ir_constant_count - 1; index >= 0; index--) if (!strcmp(ir_constant_names[index], name)) return ir_constant_values[index];
+  return NULL;
+}
+static int ir_is_number(const char *text, double *value) {
+  char *end = NULL; *value = strtod(text, &end); return end && end != text && !*end;
+}
+static char *ir_render_expr(const AstNode *node) {
+  if (!node) return duplicate_text("", 0);
+  if (node->tag == AST_IDENTIFIER) { const char *constant = ir_lookup_constant(node->first_text); return duplicate_text(constant ? constant : node->first_text, strlen(constant ? constant : node->first_text)); }
+  if (node->tag == AST_LITERAL) return duplicate_text(node->second_text, strlen(node->second_text));
+  if (node->tag == AST_BINARY) {
+    char *left = ir_render_expr(node->first_child), *right = ir_render_expr(node->second_child);
+    double a, b; char folded[80];
+    if (ir_optimize && ir_is_number(left, &a) && ir_is_number(right, &b)) {
+      double result = 0; int valid = 1;
+      if (!strcmp(node->first_text, "+")) result = a + b;
+      else if (!strcmp(node->first_text, "-")) result = a - b;
+      else if (!strcmp(node->first_text, "*")) result = a * b;
+      else if (!strcmp(node->first_text, "/") && b != 0) result = !strchr(left, '.') && !strchr(right, '.') ? (long)a / (long)b : a / b;
+      else if (!strcmp(node->first_text, "%") && b != 0) result = (long)a % (long)b;
+      else if (!strcmp(node->first_text, "<")) result = a < b;
+      else if (!strcmp(node->first_text, "<=")) result = a <= b;
+      else if (!strcmp(node->first_text, ">")) result = a > b;
+      else if (!strcmp(node->first_text, ">=")) result = a >= b;
+      else if (!strcmp(node->first_text, "==")) result = a == b;
+      else if (!strcmp(node->first_text, "!=")) result = a != b;
+      else valid = 0;
+      if (valid) { snprintf(folded, sizeof folded, "%.15g", result); free(left); free(right); return duplicate_text(folded, strlen(folded)); }
+    }
+    if (ir_optimize && (!strcmp(node->first_text, "+") || !strcmp(node->first_text, "-")) && !strcmp(right, "0")) { free(right); return left; }
+    if (ir_optimize && (!strcmp(node->first_text, "*") || !strcmp(node->first_text, "/")) && !strcmp(right, "1")) { free(right); return left; }
+    Str text = {0}; append_text(&text, left); append_text(&text, " "); append_text(&text, node->first_text); append_text(&text, " "); append_text(&text, right); free(left); free(right); return text.text;
+  }
+  if (node->tag == AST_UNARY) { char *operand = ir_render_expr(node->first_child); Str text = {0}; append_text(&text, node->first_text); append_text(&text, operand); free(operand); return text.text; }
+  return semantic_expression_text(node);
+}
+static void ir_record_constant(const char *name, const char *value) {
+  if (!ir_optimize) return;
+  double ignored;
+  if (ir_is_number(value, &ignored) || !strcmp(value, "true") || !strcmp(value, "false")) {
+    if (ir_constant_count < 256) { ir_constant_names[ir_constant_count] = duplicate_text(name, strlen(name)); ir_constant_values[ir_constant_count++] = duplicate_text(value, strlen(value)); }
+  } else {
+    for (int index = 0; index < ir_constant_count; index++) if (!strcmp(ir_constant_names[index], name)) ir_constant_values[index] = duplicate_text("?", 1);
+  }
+}
+static void emit_ir_statement(AstNode *node) {
+  if (!node) return;
+  if (node->tag == AST_BLOCK) {
+    int nested = ir_scope_depth++ > 0;
+    for (int index = 0; index < node->child_count; index++) emit_ir_statement(node->children[index]);
+    ir_scope_depth--;
+    if (nested) ir_constant_count = 0;
+  } else if (node->tag == AST_VARIABLE_DECLARATION) {
+    if (node->first_child) printf("  var %s[%s]\n", node->second_text, semantic_expression_text(node->first_child));
+    if (node->second_child) { char *value = ir_render_expr(node->second_child); printf("  %s = %s\n", node->second_text, value); ir_record_constant(node->second_text, value); free(value); }
+  } else if (node->tag == AST_EXPRESSION) {
+    AstNode *expr = node->first_child;
+    if (expr && expr->tag == AST_CALL && expr->first_child && expr->first_child->tag == AST_IDENTIFIER && !strcmp(expr->first_child->first_text, "print")) {
+      if (expr->child_count) { char *value = ir_render_expr(expr->children[0]); printf("  print %s\n", value); free(value); }
+    } else if (expr && expr->tag == AST_ASSIGNMENT) { char *value = ir_render_expr(expr->second_child); printf("  %s = %s\n", semantic_expression_text(expr->first_child), value); if (expr->first_child->tag == AST_IDENTIFIER) ir_record_constant(expr->first_child->first_text, value); free(value); }
+    else if (expr) printf("  %s\n", semantic_expression_text(expr));
+  } else if (node->tag == AST_ASSIGNMENT) {
+    char *value = ir_render_expr(node->second_child); printf("  %s = %s\n", semantic_expression_text(node->first_child), value); if (node->first_child->tag == AST_IDENTIFIER) ir_record_constant(node->first_child->first_text, value); free(value);
+  } else if (node->tag == AST_RETURN) {
+    char *value = node->first_child ? ir_render_expr(node->first_child) : duplicate_text("", 0); printf("  return%s%s\n", node->first_child ? " " : "", value); free(value);
+  } else if (node->tag == AST_IF || node->tag == AST_WHILE || node->tag == AST_FOR) {
+    AstNode *condition = node->tag == AST_IF ? node->first_child : (node->tag == AST_WHILE ? node->first_child : node->second_child);
+    if (node->tag == AST_IF) {
+      int otherwise = ++ir_label, end = node->third_child ? ++ir_label : otherwise;
+      char *test = ir_render_expr(condition); printf("  ifFalse %s goto L%d\n", test, otherwise); free(test);
+      emit_ir_statement(node->second_child);
+      if (node->third_child) printf("  goto L%d\n", end);
+      printf("L%d:\n", otherwise);
+      if (node->third_child) { emit_ir_statement(node->third_child); printf("L%d:\n", end); }
+      ir_constant_count = 0;
+    } else {
+      int saved_optimize = ir_optimize; ir_optimize = 0;
+      int head = ++ir_label, exit = ++ir_label, update = node->tag == AST_FOR ? ++ir_label : head;
+      if (node->tag == AST_FOR && node->first_child) printf("  %s\n", semantic_expression_text(node->first_child));
+      printf("L%d:\n", head);
+      if (condition) { char *test = ir_render_expr(condition); printf("  ifFalse %s goto L%d\n", test, exit); free(test); }
+      if (ir_loop_depth < 128) { ir_break_targets[ir_loop_depth] = exit; ir_continue_targets[ir_loop_depth] = update; ir_loop_depth++; }
+      emit_ir_statement(node->tag == AST_WHILE ? node->second_child : (node->child_count ? node->children[0] : NULL));
+      if (node->tag == AST_FOR) { printf("L%d:\n", update); if (node->third_child) printf("  %s\n", semantic_expression_text(node->third_child)); }
+      printf("  goto L%d\nL%d:\n", head, exit);
+      if (ir_loop_depth) ir_loop_depth--;
+      ir_optimize = saved_optimize; ir_constant_count = 0;
+    }
+  } else if ((node->tag == AST_BREAK || node->tag == AST_CONTINUE) && ir_loop_depth) {
+    int target = node->tag == AST_BREAK ? ir_break_targets[ir_loop_depth - 1] : ir_continue_targets[ir_loop_depth - 1];
+    printf("  goto L%d\n", target);
+  }
+}
+
+static void emit_ir(AstNode *program, int optimize) {
+  ir_optimize = optimize;
+  for (int index = 0; index < program->child_count; index++) {
+    AstNode *function = program->children[index];
+    if (function->tag != AST_FUNCTION) continue;
+    printf("func %s", function->second_text);
+    ir_label = 0; ir_loop_depth = 0; ir_constant_count = 0; ir_scope_depth = 0;
+    if (function->child_count) {
+      printf("(");
+      for (int parameter = 0; parameter < function->child_count; parameter++) printf("%s%s", parameter ? ", " : "", function->children[parameter]->second_text);
+      printf(")");
+    }
+    printf("\n"); emit_ir_statement(function->first_child); printf("endfunc\n");
+  }
+}
+
 int main(int argument_count, char **arguments) {
-  if (argument_count != 2
-      && !(argument_count == 3 && !strcmp(arguments[2], "--diagnostics"))) {
-    fprintf(stderr, "Uso: %s codigo.c [--diagnostics]\n", arguments[0]);
+  const char *source_path = NULL;
+  int diagnostics_mode = 0, ir_mode = 0, optimize = 0;
+  for (int index = 1; index < argument_count; index++) {
+    if (!strcmp(arguments[index], "--diagnostics")) diagnostics_mode = 1;
+    else if (!strcmp(arguments[index], "--ir") || !strcmp(arguments[index], "-O0") || !strcmp(arguments[index], "-O1")) { if (!strcmp(arguments[index], "--ir")) ir_mode = 1; if (!strcmp(arguments[index], "-O1")) optimize = 1; }
+    else if (arguments[index][0] == '-') { fprintf(stderr, "Opção desconhecida: %s\n", arguments[index]); return 2; }
+    else if (!source_path) source_path = arguments[index];
+    else { fprintf(stderr, "Uso: %s [-O0|-O1] [--ir] codigo.c [--diagnostics]\n", arguments[0]); return 2; }
+  }
+  if (!source_path) {
+    fprintf(stderr, "Uso: %s [-O0|-O1] [--ir] codigo.c [--diagnostics]\n", arguments[0]);
     return 2;
   }
-  char *source = read_source_file(arguments[1]);
+  char *source = read_source_file(source_path);
   if (!source) return 2;
 
   Tokens tokens = tokenize(source);
   AstNode *program = parse_program(&tokens);
   if (tokens.diagnostic_count) {
-    if (argument_count == 3) {
+    if (diagnostics_mode) {
       for (int index = 0; index < tokens.diagnostic_count; index++) {
         Diagnostic *diagnostic = &tokens.diagnostics[index];
         fprintf(stderr, "Erro %s: %s (linha %d, coluna %d)\n",
@@ -1428,7 +1630,8 @@ int main(int argument_count, char **arguments) {
     return 1;
   }
   free(semantic_diagnostics);
-  printf("Análise semântica concluída: 0 erros; programa aceito.");
+  if (ir_mode) emit_ir(program, optimize);
+  else printf("Análise semântica concluída: 0 erros; programa aceito.");
   free_ast(program);
   free_tokens(&tokens);
   free(source);
