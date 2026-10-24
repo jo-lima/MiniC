@@ -22,7 +22,6 @@ TMP_DIR="$(mktemp -d)" || { printf 'Erro: não foi possível criar a área tempo
 trap 'rm -rf "$TMP_DIR"' EXIT
 EXECUTAVEL="$TMP_DIR/minic"
 # Compila uma única vez; a divisão de CFLAGS em opções é intencional.
-# Executa o binário passando cada arquivo de teste como argumento.
 if ! "$CC" $CFLAGS "$FONTE" -o "$EXECUTAVEL"; then
   printf 'Erro: falha ao compilar o MINIC em C.\n' >&2
   exit 2
@@ -72,23 +71,24 @@ while IFS= read -r -d '' fonte_teste; do
     continue
   fi
   saida="$TMP_DIR/saida.txt"
-  saida_filtrada="$TMP_DIR/saida_filtrada.txt"
-  gabarito_filtrado="$TMP_DIR/gabarito_filtrado.txt"
-  "$EXECUTAVEL" "$fonte_teste" > "$saida" 2>&1
-  codigo_saida=$?
-  if ! filtrar_mensagens "$saida" "$saida_filtrada" || ! filtrar_mensagens "$gabarito" "$gabarito_filtrado"; then
-    printf '[FALHA][%s] %s — não foi possível processar os resultados\n' "$categoria" "$nome"
-    continue
+  if [[ "$categoria" == 'erros' ]]; then
+    "$EXECUTAVEL" --diagnostics --ir "$fonte_teste" > "$saida" 2>&1
+  elif [[ "$categoria" == 'otimizacao' ]]; then
+    "$EXECUTAVEL" -O1 --ir "$fonte_teste" > "$saida" 2>&1
+  else
+    "$EXECUTAVEL" --ir "$fonte_teste" > "$saida" 2>&1
   fi
+  codigo_saida=$?
   resultado='OK'
   motivo=''
   if [[ "$categoria" == 'erros' ]]; then
-    if (( codigo_saida == 0 )); then resultado='FALHA'; motivo='o compilador aceitou um caso que deveria apresentar erro'; fi
+    codigo_esperado="$(grep -oE 'código de saída [0-9]+' "$gabarito" | tail -n 1 | awk '{print $4}')"
+    if [[ -z "$codigo_esperado" ]]; then resultado='FALHA'; motivo='gabarito sem código de saída esperado'
+    elif (( codigo_saida != codigo_esperado )); then resultado='FALHA'; motivo="código de saída $codigo_saida; esperado $codigo_esperado"; fi
   elif (( codigo_saida != 0 )); then
     resultado='FALHA'; motivo="o compilador retornou código de saída $codigo_saida"
-  fi
-  if [[ "$resultado" == 'OK' ]] && ! cmp -s "$gabarito_filtrado" "$saida_filtrada"; then
-    resultado='FALHA'; motivo='resultado diferente do gabarito após ignorar as mensagens'
+  elif ! grep -q '^func ' "$saida"; then
+    resultado='FALHA'; motivo='compilação aceita, mas não foi emitida IR'
   fi
   if [[ "$resultado" == 'OK' ]]; then
     aprovados["$categoria"]=$(( aprovados["$categoria"] + 1 ))

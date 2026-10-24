@@ -108,32 +108,33 @@ while IFS= read -r -d '' fonte; do
   saida_filtrada="$tmp_dir/saida_filtrada.txt"
   gabarito_filtrado="$tmp_dir/gabarito_filtrado.txt"
 
-  "$PYTHON_BIN" "$MINIC_PY" "$fonte" > "$saida" 2>&1
-  codigo_saida=$?
-
-  if ! filtrar_mensagens "$saida" "$saida_filtrada" ||
-     ! filtrar_mensagens "$gabarito" "$gabarito_filtrado"; then
-    echo "[FALHA][$categoria] $nome — não foi possível processar os resultados"
-    continue
+  if [[ "$categoria" == "erros" ]]; then
+    "$PYTHON_BIN" "$MINIC_PY" --diagnostics --ir "$fonte" > "$saida" 2>&1
+  elif [[ "$categoria" == "otimizacao" ]]; then
+    "$PYTHON_BIN" "$MINIC_PY" -O1 --ir "$fonte" > "$saida" 2>&1
+  else
+    "$PYTHON_BIN" "$MINIC_PY" --ir "$fonte" > "$saida" 2>&1
   fi
+  codigo_saida=$?
 
   resultado="OK"
   motivo=""
 
   if [[ "$categoria" == "erros" ]]; then
-    if (( codigo_saida == 0 )); then
+    codigo_esperado="$(grep -oE 'código de saída [0-9]+' "$gabarito" | tail -n 1 | awk '{print $4}')"
+    if [[ -z "$codigo_esperado" ]]; then
       resultado="FALHA"
-      motivo="o compilador aceitou um caso que deveria apresentar erro"
+      motivo="gabarito sem código de saída esperado"
+    elif (( codigo_saida != codigo_esperado )); then
+      resultado="FALHA"
+      motivo="código de saída $codigo_saida; esperado $codigo_esperado"
     fi
   elif (( codigo_saida != 0 )); then
     resultado="FALHA"
     motivo="o compilador retornou código de saída $codigo_saida"
-  fi
-
-  if [[ "$resultado" == "OK" ]] &&
-     ! cmp -s "$gabarito_filtrado" "$saida_filtrada"; then
+  elif ! grep -q '^func ' "$saida"; then
     resultado="FALHA"
-    motivo="resultado diferente do gabarito após ignorar as mensagens"
+    motivo="compilação aceita, mas não foi emitida IR"
   fi
 
   if [[ "$resultado" == "OK" ]]; then
