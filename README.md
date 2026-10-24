@@ -1,104 +1,88 @@
-# MiniC - Analisador Léxico
+# MiniC
 
-Implementação de um analisador léxico (scanner) para a linguagem MiniC, desenvolvido em Python. O scanner processa programas em linguagem C simplificada e gera a sequência de tokens estruturada em formato JSON.
+Compilador didático para um subconjunto de C, com implementações em Python e C. O projeto inclui análise léxica, análise sintática, verificação semântica e emissão opcional de uma representação intermediária (IR).
 
----
+## Estrutura
 
-## Estrutura do Projeto
+- `MiniCompiler/MiniCompiler.py`: ponto de entrada Python; coordena scanner, parser, análise semântica e geração de IR.
+- `MiniCompiler/scanner.py`: transforma o texto em tokens e registra erros léxicos.
+- `MiniCompiler/MiniCompiler.c`: implementação C do compilador.
+- `testes/testes-semanticos/`: fontes e gabaritos dos testes semânticos.
+- `testes/ir-test-cases/`: fontes e critérios dos testes de IR e otimização.
+- `testes/testes-ap1/TESTES-AP1-PT2/testes-parser-50/`: fixtures do parser, incluindo ASTs esperadas.
 
-```text
-MiniC/
-├── Py/
-│   └── Lexichal.py                                  # Implementação do analisador léxico
-├── Testes/
-│   └── tests.py                                     # Script para executar os testes
-├── Codigos C/
-│   └── testes-scanner-minic_codes/
-│       └── casos-programas-c/
-│           ├── c01_fibonacci.c
-│           ├── c02_primos.c
-│           ├── c03_media_vetor.c
-│           ├── c04_menu_interativo.c
-│           └── c05_controle_temperatura.c
-└── resultados/                                      # Pasta gerada com os resultados dos testes
-```
+## Requisitos
 
----
+- Python 3 para executar a versão Python.
+- GCC e Bash para compilar a versão C e executar os runners `.sh` no Linux.
 
-## Funcionamento
+## Uso
 
-O analisador léxico percorre o código fonte caractere por caractere, identificando e classificando os tokens de acordo com as regras da linguagem MINIC. Para cada token encontrado, é gerado um JSON com as seguintes informações:
-
-```json
-{
-  "type": "tipo_do_token",
-  "value": "lexema_encontrado",
-  "row": 0,
-  "colSpan": [posicao_inicial, posicao_final]
-}
-```
-
----
-
-## Como Executar
-
-### 1. Pré-requisitos
-Certifique-se de ter o Python instalado e instale a biblioteca regex:
+### Python
 
 ```bash
-pip install regex
+python3 MiniCompiler/MiniCompiler.py programa.c
 ```
 
-### 2. Execução dos Testes
-Execute o script de testes:
+### C
+
+Compile uma vez e execute o binário:
 
 ```bash
-python tests.py
+gcc -std=c11 -Wall -Wextra MiniCompiler/MiniCompiler.c -o minic
+./minic programa.c
 ```
 
-Os resultados serão gerados na pasta `resultados/` no formato JSON Lines (`.jsonl`), onde cada linha contém um token.
-
----
-
-## Exemplo de Saída
-
-Para o código:
-
-```c
-int resultado = 42
-```
-
-O analisador gera:
-
-```json
-{"type":"function","value":"int","row":0,"colSpan":[0,3]}
-{"type":"var","value":"resultado","row":0,"colSpan":[4,13]}
-{"type":"operator","value":"=","row":0,"colSpan":[14,15]}
-{"type":"int","value":"42","row":0,"colSpan":[16,18]}
-```
-
-## Integração scanner/parser
-
-O scanner independente está em `MiniCompiler/scanner.py`. Ele pode ser usado
-diretamente:
-
-```python
-from scanner import Scanner
-from MiniCompiler import Parser
-
-scanner = Scanner("int x; @")
-tokens = scanner.scan()
-parser = Parser(tokens)
-tree = parser.parse()
-erros = scanner.errors + parser.errors
-```
-
-O scanner e o parser acumulam diagnósticos e continuam a análise após pontos
-de recuperação. Para exibir todos os diagnósticos pela linha de comando:
+### Opções
 
 ```bash
-python MiniCompiler/MiniCompiler.py codigo.c --diagnostics
+python3 MiniCompiler/MiniCompiler.py --diagnostics programa.c
+python3 MiniCompiler/MiniCompiler.py --ir programa.c
+python3 MiniCompiler/MiniCompiler.py -O1 --ir programa.c
+./minic --diagnostics programa.c
+./minic --ir programa.c
+./minic -O1 --ir programa.c
 ```
 
-Sem essa opção, a saída mantém o formato compatível com os testes do parser:
-uma AST para entradas válidas ou `NÃO HÁ AST` para entradas rejeitadas.
+- Sem opções, o compilador valida o programa e informa se foi aceito.
+- `--diagnostics` solicita a listagem dos erros léxicos e sintáticos encontrados.
+- `--ir` emite a representação intermediária.
+- `-O0` seleciona o modo sem otimização (padrão); `-O1` ativa as otimizações implementadas.
+
+A CLI atual não imprime a AST para entradas válidas: imprime a mensagem de aceitação ou, com `--ir`, a IR. Por isso, os fixtures da suíte AP1 que esperam a AST não correspondem à saída atual da CLI.
+
+## Testes
+
+Execute os runners a partir da raiz do repositório.
+
+### IR em Python
+
+```bash
+bash testes/ir-test-cases/test_ir_python.sh \
+  MiniCompiler/MiniCompiler.py \
+  testes/ir-test-cases/testes
+```
+
+### IR em C
+
+```bash
+bash testes/ir-test-cases/test_ir_c.sh \
+  MiniCompiler/MiniCompiler.c \
+  testes/ir-test-cases/testes
+```
+
+O runner C usa GCC por padrão; é possível escolher outro compilador compatível com `CC`, por exemplo `CC=clang`. Os runners de IR verificam aceitação/rejeição e emissão de IR; eles não comparam toda a IR gerada byte a byte com os gabaritos. Os critérios e limitações estão em `testes/ir-test-cases/README.md`.
+
+### Testes semânticos
+
+```bash
+bash testes/testes-semanticos/testes_semanticos_py.sh \
+  MiniCompiler/MiniCompiler.py \
+  testes/testes-semanticos/testes
+
+bash testes/testes-semanticos/testes_semanticos_c.sh \
+  MiniCompiler/MiniCompiler.c \
+  testes/testes-semanticos/testes
+```
+
+Esses scripts comparam a saída dos compiladores com os arquivos `.gabarito`.
